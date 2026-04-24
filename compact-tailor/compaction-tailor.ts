@@ -355,7 +355,7 @@ async function generateContinuationPrompt(
 					agentConfig.model.includes("/") ? agentConfig.model.split("/").slice(1).join("/") : agentConfig.model,
 				)
 			: null,
-		ctx.modelRegistry.find("zai", "glm-4.5-air"),     // 快速便宜
+		ctx.modelRegistry.find("zai", "glm-4.7"),           // 快速便宜
 		ctx.modelRegistry.find("google", "gemini-2.5-flash"),
 		ctx.modelRegistry.find("anthropic", "claude-haiku-4-5"),
 		ctx.model, // fallback
@@ -443,15 +443,15 @@ export default function (pi: ExtensionAPI) {
 		const { preparation, customInstructions, signal } = event;
 		const { messagesToSummarize, turnPrefixMessages, tokensBefore, firstKeptEntryId, previousSummary } = preparation;
 
-		const model = ctx.modelRegistry.find("zai", "glm-5.1");
+		const model = ctx.modelRegistry.find("zai", "glm-4.7");
 		if (!model) {
-			notify(ctx, "找不到 glm-5.1，降级使用默认 compaction", "warning");
+			notify(ctx, "找不到 glm-4.7，降级使用默认 compaction", "warning");
 			return;
 		}
 
 		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
 		if (!auth.ok || !auth.apiKey) {
-			notify(ctx, "glm-5.1 认证失败，降级使用默认 compaction", "warning");
+			notify(ctx, "glm-4.7 认证失败，降级使用默认 compaction", "warning");
 			return;
 		}
 
