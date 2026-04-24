@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { getAgentDir, parseFrontmatter } from "@mariozechner/pi-coding-agent";
+import { Container, Text, getKeybindings } from "@mariozechner/pi-tui";
 import type { AutocompleteItem } from "@mariozechner/pi-tui";
 
 type AgentSource = "user" | "project";
@@ -89,7 +90,8 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 		}
 
 		const { frontmatter, body } = parseFrontmatter<Record<string, unknown>>(content);
-		const name = asString(frontmatter.name) ?? path.basename(entry.name, ".md");
+		const name = asString(frontmatter.name);
+		if (!name) continue;
 		const description = asString(frontmatter.description) ?? "";
 		const tools = asStringArray(frontmatter.tools);
 		const model = asString(frontmatter.model);
@@ -284,20 +286,105 @@ export default function (pi: ExtensionAPI) {
 			return null;
 		}
 
-		const labels = [
-			activeAgent ? `default — restore session defaults` : `default (active) — restore session defaults`,
-			...agents.map((agent) => {
-				const activeLabel = activeAgent?.name === agent.name ? " (active)" : "";
-				const source = agent.source === "project" ? "project" : "user";
-				const desc = agent.description ? ` — ${agent.description}` : "";
-				return `${agent.name}${activeLabel} [${source}]${desc}`;
-			}),
+		interface AgentItem {
+			name: string;
+			label: string;
+			description?: string;
+		}
+
+		const items: AgentItem[] = [
+			{
+				name: "default",
+				label: activeAgent ? "default" : "default (active)",
+				description: "restore session defaults",
+			},
+			...agents.map((agent) => ({
+				name: agent.name,
+				label: `${agent.name}${activeAgent?.name === agent.name ? " (active)" : ""} [${agent.source === "project" ? "project" : "user"}]`,
+				description: agent.description || undefined,
+			})),
 		];
 
-		const selected = await ctx.ui.select("Select agent", labels);
-		if (!selected) return null;
-		if (selected.startsWith("default")) return "default";
-		return selected.split(" ")[0] ?? null;
+		try {
+			const result = await ctx.ui.custom<string>((tui, th, _kb, done) => {
+				let selectedIndex = 0;
+				const maxVisible = 8;
+				const listContainer = new Container();
+
+				function updateList() {
+					listContainer.clear();
+
+					const startIndex = Math.max(
+						0,
+						Math.min(selectedIndex - Math.floor(maxVisible / 2), items.length - maxVisible),
+					);
+					const endIndex = Math.min(startIndex + maxVisible, items.length);
+
+					for (let i = startIndex; i < endIndex; i++) {
+						const item = items[i];
+						if (!item) continue;
+						const isSelected = i === selectedIndex;
+
+						if (isSelected) {
+							listContainer.addChild(
+								new Text(
+									th.fg("accent", "→ ") + th.bold(th.fg("accent", item.label)),
+									1,
+									0,
+								),
+							);
+							if (item.description) {
+								listContainer.addChild(
+									new Text(th.fg("muted", `  ${item.description}`), 1, 0),
+								);
+							}
+						} else {
+							listContainer.addChild(new Text(`  ${item.label}`, 1, 0));
+							if (item.description) {
+								listContainer.addChild(
+									new Text(th.fg("dim", `  ${item.description}`), 1, 0),
+								);
+							}
+						}
+					}
+
+					if (startIndex > 0 || endIndex < items.length) {
+						const scrollText = `  (${selectedIndex + 1}/${items.length})`;
+						listContainer.addChild(new Text(th.fg("muted", scrollText), 1, 0));
+					}
+
+					tui.requestRender();
+				}
+
+				updateList();
+
+				const component = listContainer as typeof listContainer & {
+					handleInput(keyData: unknown): void;
+					dispose(): void;
+				};
+				component.handleInput = (keyData: unknown) => {
+					const kb = getKeybindings();
+					if (kb.matches(keyData, "tui.select.up") || keyData === "k") {
+						selectedIndex = Math.max(0, selectedIndex - 1);
+						updateList();
+					} else if (kb.matches(keyData, "tui.select.down") || keyData === "j") {
+						selectedIndex = Math.min(items.length - 1, selectedIndex + 1);
+						updateList();
+					} else if (kb.matches(keyData, "tui.select.confirm") || keyData === "\n") {
+						done(items[selectedIndex].name);
+					} else if (kb.matches(keyData, "tui.select.cancel")) {
+						done("");
+					}
+				};
+				component.dispose = () => {};
+
+				return component;
+			});
+
+			return result || null;
+		} catch {
+			return null;
+		}
 	}
 
 	function renderAgentList(cwd: string): string {
@@ -373,10 +460,11 @@ export default function (pi: ExtensionAPI) {
 		description: "Switch main-session agent identity from ~/.pi/agent/agents/*.md or .pi/agents/*.md",
 		getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
 			const candidates = [
-				{ value: "default", label: "default" },
+				{ value: "default", label: "default", description: "restore session defaults" },
 				...discoverAgents(process.cwd()).map((agent) => ({
 					value: agent.name,
-					label: agent.description ? `${agent.name} — ${agent.description}` : agent.name,
+					label: agent.name,
+					description: agent.description || undefined,
 				})),
 			];
 			const filtered = candidates.filter((item) => item.value.startsWith(prefix));
