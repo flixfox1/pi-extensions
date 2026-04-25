@@ -71,46 +71,92 @@ function findNearestProjectAgentsDir(cwd: string): string | null {
 	}
 }
 
+function warnAgentNameMismatch(filePath: string, directoryName: string, frontmatterName: string) {
+	console.warn(
+		`Agent directory name "${directoryName}" does not match AGENT.md frontmatter name "${frontmatterName}" in ${filePath}; using directory name.`,
+	);
+}
+
+function parseAgentFile(filePath: string, source: AgentSource, nameOverride?: string): AgentConfig | null {
+	let content = "";
+	try {
+		content = fs.readFileSync(filePath, "utf8");
+	} catch {
+		return null;
+	}
+
+	const { frontmatter, body } = parseFrontmatter<Record<string, unknown>>(content);
+	const frontmatterName = asString(frontmatter.name);
+	const name = nameOverride ?? frontmatterName;
+	if (!name) return null;
+
+	if (nameOverride && frontmatterName && frontmatterName !== nameOverride) {
+		warnAgentNameMismatch(filePath, nameOverride, frontmatterName);
+	}
+
+	const description = asString(frontmatter.description) ?? "";
+	const tools = asStringArray(frontmatter.tools);
+	const model = asString(frontmatter.model);
+	const welcomeMessage = asString(frontmatter.welcomeMessage);
+	const prompt = body.trim();
+
+	return {
+		name,
+		description,
+		tools,
+		model,
+		welcomeMessage,
+		prompt,
+		source,
+		filePath,
+	};
+}
+
+function collectDirectoryAgents(dir: string, source: AgentSource, resultByName: Map<string, AgentConfig>) {
+	let entries: fs.Dirent[];
+	try {
+		entries = fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+	} catch {
+		return;
+	}
+
+	for (const entry of entries) {
+		const entryPath = path.join(dir, entry.name);
+		if (!isDirectory(entryPath)) continue;
+
+		const agentFilePath = path.join(entryPath, "AGENT.md");
+		if (fs.existsSync(agentFilePath)) {
+			const agent = parseAgentFile(agentFilePath, source, entry.name);
+			if (agent) resultByName.set(agent.name, agent);
+			continue;
+		}
+
+		collectDirectoryAgents(entryPath, source, resultByName);
+	}
+}
+
 function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 	if (!isDirectory(dir)) return [];
 
-	const result: AgentConfig[] = [];
-	const entries = fs.readdirSync(dir, { withFileTypes: true });
+	const resultByName = new Map<string, AgentConfig>();
+	let entries: fs.Dirent[];
+	try {
+		entries = fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+	} catch {
+		return [];
+	}
 
 	for (const entry of entries) {
 		if (!entry.name.endsWith(".md")) continue;
 		if (!entry.isFile() && !entry.isSymbolicLink()) continue;
 
-		const filePath = path.join(dir, entry.name);
-		let content = "";
-		try {
-			content = fs.readFileSync(filePath, "utf8");
-		} catch {
-			continue;
-		}
-
-		const { frontmatter, body } = parseFrontmatter<Record<string, unknown>>(content);
-		const name = asString(frontmatter.name);
-		if (!name) continue;
-		const description = asString(frontmatter.description) ?? "";
-		const tools = asStringArray(frontmatter.tools);
-		const model = asString(frontmatter.model);
-		const welcomeMessage = asString(frontmatter.welcomeMessage);
-		const prompt = body.trim();
-
-		result.push({
-			name,
-			description,
-			tools,
-			model,
-			welcomeMessage,
-			prompt,
-			source,
-			filePath,
-		});
+		const agent = parseAgentFile(path.join(dir, entry.name), source);
+		if (agent) resultByName.set(agent.name, agent);
 	}
 
-	return result;
+	collectDirectoryAgents(dir, source, resultByName);
+
+	return Array.from(resultByName.values());
 }
 
 function discoverAgents(cwd: string): AgentConfig[] {
@@ -282,7 +328,7 @@ export default function (pi: ExtensionAPI) {
 	async function showAgentSelector(ctx: ExtensionContext): Promise<string | null> {
 		const agents = discoverAgents(ctx.cwd);
 		if (agents.length === 0) {
-			notify(ctx, "未发现 agent。可放在 ~/.pi/agent/agents/*.md 或 .pi/agents/*.md", "warning");
+			notify(ctx, "未发现 agent。可放在 ~/.pi/agent/agents/*.md、~/.pi/agent/agents/*/AGENT.md、.pi/agents/*.md 或 .pi/agents/*/AGENT.md", "warning");
 			return null;
 		}
 
@@ -390,7 +436,7 @@ export default function (pi: ExtensionAPI) {
 	function renderAgentList(cwd: string): string {
 		const agents = discoverAgents(cwd);
 		if (agents.length === 0) {
-			return "未发现 agent。可放在 ~/.pi/agent/agents/*.md 或 .pi/agents/*.md";
+			return "未发现 agent。可放在 ~/.pi/agent/agents/*.md、~/.pi/agent/agents/*/AGENT.md、.pi/agents/*.md 或 .pi/agents/*/AGENT.md";
 		}
 
 		const lines = [
@@ -457,7 +503,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("agent", {
-		description: "Switch main-session agent identity from ~/.pi/agent/agents/*.md or .pi/agents/*.md",
+		description: "Switch main-session agent identity from ~/.pi/agent/agents/*.md, ~/.pi/agent/agents/*/AGENT.md, .pi/agents/*.md, or .pi/agents/*/AGENT.md",
 		getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
 			const candidates = [
 				{ value: "default", label: "default", description: "restore session defaults" },

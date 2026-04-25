@@ -1,0 +1,20 @@
+# Compaction v3 默认配置
+# 文件位置: ~/.pi/agent/extensions/compact-tailor/config.yaml
+# 无此文件时全部使用默认值，零配置即可运行
+# 也可通过 /compact 交互修改
+
+threshold: 85
+summarize-model: openai-codex/gpt-5.5
+max-tokens: 8192
+
+archive:
+  enabled: false
+  dir: .pi/compaction-archives
+
+dynamic-instruction:
+  enabled: false
+
+static-instruction:
+  enabled: false
+  content: "wait for my instruction"
+  # file: ""
