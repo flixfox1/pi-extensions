@@ -4,7 +4,7 @@
 # 也可通过 /compact 交互修改
 
 threshold: 85
-summarize-model: openai-codex/gpt-5.5
+summarize-model: zai/glm-4.7
 max-tokens: 8192
 
 archive:
