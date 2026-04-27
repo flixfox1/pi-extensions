@@ -2,8 +2,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { getAgentDir, parseFrontmatter } from "@mariozechner/pi-coding-agent";
-import { Container, Text, getKeybindings } from "@mariozechner/pi-tui";
-import type { AutocompleteItem } from "@mariozechner/pi-tui";
+import { matchesKey, visibleWidth, truncateToWidth } from "@mariozechner/pi-tui";
+import type { AutocompleteItem, Component, TUI, Theme } from "@mariozechner/pi-tui";
 
 type AgentSource = "user" | "project";
 
@@ -29,8 +29,9 @@ interface PersistedState {
 	fallbackTools?: string[];
 }
 
-const STATE_ENTRY = "agent-switcher-state";
-const WIDGET_ID = "agent-switcher";
+const STATE_ENTRY = "switch-agent-state";
+const WIDGET_ID = "switch-agent";
+const WELCOME_TYPE = "switch-agent-welcome";
 
 function asString(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
@@ -219,7 +220,7 @@ export default function (pi: ExtensionAPI) {
 
 	function notify(ctx: ExtensionContext, message: string, level: "info" | "warning" | "error") {
 		if (ctx.hasUI) ctx.ui.notify(message, level);
-		else console.log(`[agent-switcher:${level}] ${message}`);
+		else console.log(`[switch-agent:${level}] ${message}`);
 	}
 
 	function updateWidget(ctx: ExtensionContext) {
@@ -309,7 +310,15 @@ export default function (pi: ExtensionAPI) {
 		updateWidget(ctx);
 		if (options.persist) persistState(agent.name);
 		if (options.notify) {
-			notify(ctx, agent.welcomeMessage ?? `Switched to agent: ${agent.name}`, "info");
+			if (agent.welcomeMessage) {
+				pi.sendMessage({
+					customType: WELCOME_TYPE,
+					content: agent.welcomeMessage,
+					display: true,
+				});
+			} else {
+				notify(ctx, `Switched to agent: ${agent.name}`, "info");
+			}
 		}
 	}
 
@@ -325,6 +334,257 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	// --- Selector UI helpers (overlay panel style) ---
+
+	const SELECTOR_VIEWPORT = 8;
+	const OVERLAY_WIDTH = 84;
+
+	function selectorPad(s: string, len: number): string {
+		return s + " ".repeat(Math.max(0, len - visibleWidth(s)));
+	}
+
+	function selectorRow(content: string, width: number, theme: Theme): string {
+		const innerW = width - 2;
+		return theme.fg("border", "│") + selectorPad(content, innerW) + theme.fg("border", "│");
+	}
+
+	function selectorHeader(text: string, width: number, theme: Theme): string {
+		const innerW = width - 2;
+		const padLen = Math.max(0, innerW - visibleWidth(text));
+		const padLeft = Math.floor(padLen / 2);
+		const padRight = padLen - padLeft;
+		return (
+			theme.fg("border", "╭" + "─".repeat(padLeft)) +
+			theme.fg("accent", text) +
+			theme.fg("border", "─".repeat(padRight) + "╮")
+		);
+	}
+
+	function selectorFooter(text: string, width: number, theme: Theme): string {
+		const innerW = width - 2;
+		const padLen = Math.max(0, innerW - visibleWidth(text));
+		const padLeft = Math.floor(padLen / 2);
+		const padRight = padLen - padLeft;
+		return (
+			theme.fg("border", "╰" + "─".repeat(padLeft)) +
+			theme.fg("dim", text) +
+			theme.fg("border", "─".repeat(padRight) + "╯")
+		);
+	}
+
+	interface SelectorItem {
+		name: string;
+		description: string;
+		model?: string;
+		source: AgentSource;
+		isActive: boolean;
+	}
+
+	class AgentSelectorComponent implements Component {
+		private tui: TUI;
+		private theme: Theme;
+		private done: (result: string | undefined) => void;
+		private items: SelectorItem[];
+		private filtered: SelectorItem[];
+		private cursor = 0;
+		private scrollOffset = 0;
+		private filterQuery = "";
+		private width: number;
+
+		constructor(
+			tui: TUI,
+			theme: Theme,
+			items: SelectorItem[],
+			done: (result: string | undefined) => void,
+		) {
+			this.tui = tui;
+			this.theme = theme;
+			this.done = done;
+			this.items = items;
+			this.filtered = items;
+			this.width = OVERLAY_WIDTH;
+		}
+
+		private applyFilter(): void {
+			const q = this.filterQuery.trim().toLowerCase();
+			if (!q) {
+				this.filtered = this.items;
+			} else {
+				this.filtered = this.items.filter(
+					(item) =>
+						item.name.toLowerCase().includes(q) ||
+						item.description.toLowerCase().includes(q),
+				);
+			}
+			this.cursor = 0;
+			this.scrollOffset = 0;
+		}
+
+		private clampCursor(): void {
+			const f = this.filtered;
+			if (f.length === 0) {
+				this.cursor = 0;
+				this.scrollOffset = 0;
+				return;
+			}
+			this.cursor = Math.max(0, Math.min(this.cursor, f.length - 1));
+			const maxOffset = Math.max(0, f.length - SELECTOR_VIEWPORT);
+			this.scrollOffset = Math.max(0, Math.min(this.scrollOffset, maxOffset));
+			if (this.cursor < this.scrollOffset) this.scrollOffset = this.cursor;
+			else if (this.cursor >= this.scrollOffset + SELECTOR_VIEWPORT) this.scrollOffset = this.cursor - SELECTOR_VIEWPORT + 1;
+		}
+
+		handleInput(data: string): void {
+			if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
+				if (this.filterQuery.length > 0) {
+					this.filterQuery = "";
+					this.applyFilter();
+					this.tui.requestRender();
+					return;
+				}
+				this.done(undefined);
+				return;
+			}
+
+			if (matchesKey(data, "return")) {
+				if (this.filtered.length > 0) {
+					const item = this.filtered[this.cursor];
+					this.done(item?.name);
+				} else {
+					this.done(undefined);
+				}
+				return;
+			}
+
+			if (matchesKey(data, "up")) {
+				this.cursor -= 1;
+				this.clampCursor();
+				this.tui.requestRender();
+				return;
+			}
+
+			if (matchesKey(data, "down")) {
+				this.cursor += 1;
+				this.clampCursor();
+				this.tui.requestRender();
+				return;
+			}
+
+			if (matchesKey(data, "backspace")) {
+				if (this.filterQuery.length > 0) {
+					this.filterQuery = this.filterQuery.slice(0, -1);
+					this.applyFilter();
+					this.tui.requestRender();
+				}
+				return;
+			}
+
+			if (data.length === 1 && data.charCodeAt(0) >= 32) {
+				this.filterQuery += data;
+				this.applyFilter();
+				this.tui.requestRender();
+				return;
+			}
+		}
+
+		render(width: number): string[] {
+			const w = Math.min(width, OVERLAY_WIDTH);
+			const th = this.theme;
+			const lines: string[] = [];
+
+			const f = this.filtered;
+			const cursor = f.length === 0 ? 0 : Math.max(0, Math.min(this.cursor, f.length - 1));
+			const maxOffset = Math.max(0, f.length - SELECTOR_VIEWPORT);
+			const scrollOffset = Math.max(0, Math.min(this.scrollOffset, maxOffset));
+			const adjustedScroll = cursor < scrollOffset ? cursor
+				: cursor >= scrollOffset + SELECTOR_VIEWPORT ? cursor - SELECTOR_VIEWPORT + 1
+				: scrollOffset;
+
+			const agentCount = this.items.filter((i) => i.name !== "default").length;
+			lines.push(selectorHeader(` Switch Agent [${agentCount}] `, w, th));
+			lines.push(selectorRow("", w, th));
+
+			// Search bar
+			const cursorCh = th.fg("accent", "│");
+			const searchIcon = th.fg("dim", "◎");
+			const placeholder = th.fg("dim", "\x1b[3mtype to filter...\x1b[23m");
+			const queryDisplay = this.filterQuery ? `${this.filterQuery}${cursorCh}` : `${cursorCh}${placeholder}`;
+			lines.push(selectorRow(` ${searchIcon}  ${queryDisplay}`, w, th));
+			lines.push(selectorRow("", w, th));
+
+			// Agent list
+			const innerW = w - 2;
+			const nameWidth = 18;
+			const modelWidth = 12;
+			const scopeWidth = 8;
+
+			const startIdx = adjustedScroll;
+			const endIdx = f.length === 0 ? 0 : Math.min(f.length, startIdx + SELECTOR_VIEWPORT);
+			const visible = f.slice(startIdx, endIdx);
+
+			if (f.length === 0) {
+				lines.push(selectorRow(` ${th.fg("dim", "No matching agents")}`, w, th));
+				for (let i = 1; i < SELECTOR_VIEWPORT; i++) lines.push(selectorRow("", w, th));
+			} else {
+				for (let i = 0; i < visible.length; i++) {
+					const item = visible[i]!;
+					const index = startIdx + i;
+					const isCursor = index === cursor;
+		
+					const cursorChar = isCursor ? th.fg("accent", ">") : " ";
+					const activeMarker = item.isActive ? th.fg("accent", "●") : " ";
+		
+					const nameText = isCursor ? th.fg("accent", item.name) : item.name;
+		
+					const modelRaw = item.model ?? "default";
+					const modelDisplay = modelRaw.includes("/") ? modelRaw.split("/").pop() ?? modelRaw : modelRaw;
+					const modelText = th.fg("dim", modelDisplay);
+
+					const scopeLabel = item.name === "default"
+						? "[default]"
+						: `[${item.source === "project" ? "proj" : "user"}]`;
+					const scopeBadge = th.fg("dim", scopeLabel);
+
+					const descWidth = Math.max(0, innerW - 3 - nameWidth - modelWidth - scopeWidth - 4);
+					const descClean = item.description.replace(/[\r\n]+/g, " ");
+					const descText = th.fg("dim", descClean);
+
+					const line =
+						`${cursorChar}${activeMarker} ` +
+						selectorPad(nameText, nameWidth) + " " +
+						selectorPad(modelText, modelWidth) + " " +
+						selectorPad(scopeBadge, scopeWidth) + " " +
+						truncateToWidth(descText, descWidth);
+
+					lines.push(selectorRow(` ${line}`, w, th));
+				}
+
+				for (let i = visible.length; i < SELECTOR_VIEWPORT; i++) {
+					lines.push(selectorRow("", w, th));
+				}
+			}
+
+			// Status line
+			lines.push(selectorRow("", w, th));
+			const cursorItem = f[cursor];
+			const desc = cursorItem ? cursorItem.description.replace(/[\r\n]+/g, " ") : "";
+			let scrollInfo = "";
+			if (adjustedScroll > 0) scrollInfo += `↑ ${adjustedScroll} more`;
+			if (endIdx < f.length) scrollInfo += `${scrollInfo ? "  " : ""}↓ ${f.length - endIdx} more`;
+			const statusContent = desc || scrollInfo;
+			lines.push(selectorRow(statusContent ? ` ${th.fg("dim", statusContent)}` : "", w, th));
+			lines.push(selectorRow("", w, th));
+
+			// Footer
+			lines.push(selectorFooter(" [enter] switch  [esc] close ", w, th));
+
+			return lines;
+		}
+
+		invalidate(): void {}
+		dispose(): void {}
+	}
+
 	async function showAgentSelector(ctx: ExtensionContext): Promise<string | null> {
 		const agents = discoverAgents(ctx.cwd);
 		if (agents.length === 0) {
@@ -332,102 +592,29 @@ export default function (pi: ExtensionAPI) {
 			return null;
 		}
 
-		interface AgentItem {
-			name: string;
-			label: string;
-			description?: string;
-		}
-
-		const items: AgentItem[] = [
+		const items: SelectorItem[] = [
 			{
 				name: "default",
-				label: activeAgent ? "default" : "default (active)",
 				description: "restore session defaults",
+				isActive: !activeAgent,
+				source: "user" as AgentSource,
 			},
 			...agents.map((agent) => ({
 				name: agent.name,
-				label: `${agent.name}${activeAgent?.name === agent.name ? " (active)" : ""} [${agent.source === "project" ? "project" : "user"}]`,
-				description: agent.description || undefined,
+				description: agent.description || "",
+				model: agent.model,
+				source: agent.source,
+				isActive: activeAgent?.name === agent.name,
 			})),
 		];
 
 		try {
-			const result = await ctx.ui.custom<string>((tui, th, _kb, done) => {
-				let selectedIndex = 0;
-				const maxVisible = 8;
-				const listContainer = new Container();
-
-				function updateList() {
-					listContainer.clear();
-
-					const startIndex = Math.max(
-						0,
-						Math.min(selectedIndex - Math.floor(maxVisible / 2), items.length - maxVisible),
-					);
-					const endIndex = Math.min(startIndex + maxVisible, items.length);
-
-					for (let i = startIndex; i < endIndex; i++) {
-						const item = items[i];
-						if (!item) continue;
-						const isSelected = i === selectedIndex;
-
-						if (isSelected) {
-							listContainer.addChild(
-								new Text(
-									th.fg("accent", "→ ") + th.bold(th.fg("accent", item.label)),
-									1,
-									0,
-								),
-							);
-							if (item.description) {
-								listContainer.addChild(
-									new Text(th.fg("muted", `  ${item.description}`), 1, 0),
-								);
-							}
-						} else {
-							listContainer.addChild(new Text(`  ${item.label}`, 1, 0));
-							if (item.description) {
-								listContainer.addChild(
-									new Text(th.fg("dim", `  ${item.description}`), 1, 0),
-								);
-							}
-						}
-					}
-
-					if (startIndex > 0 || endIndex < items.length) {
-						const scrollText = `  (${selectedIndex + 1}/${items.length})`;
-						listContainer.addChild(new Text(th.fg("muted", scrollText), 1, 0));
-					}
-
-					tui.requestRender();
-				}
-
-				updateList();
-
-				const component = listContainer as typeof listContainer & {
-					handleInput(keyData: unknown): void;
-					dispose(): void;
-				};
-				component.handleInput = (keyData: unknown) => {
-					const kb = getKeybindings();
-					if (kb.matches(keyData, "tui.select.up") || keyData === "k") {
-						selectedIndex = Math.max(0, selectedIndex - 1);
-						updateList();
-					} else if (kb.matches(keyData, "tui.select.down") || keyData === "j") {
-						selectedIndex = Math.min(items.length - 1, selectedIndex + 1);
-						updateList();
-					} else if (kb.matches(keyData, "tui.select.confirm") || keyData === "\n") {
-						done(items[selectedIndex].name);
-					} else if (kb.matches(keyData, "tui.select.cancel")) {
-						done("");
-					}
-				};
-				component.dispose = () => {};
-
-				return component;
-			});
-
-			return result || null;
+			const result = await ctx.ui.custom<string | undefined>(
+				(tui, theme, _kb, done) =>
+					new AgentSelectorComponent(tui, theme, items, done),
+				{ overlay: true, overlayOptions: { anchor: "center", width: OVERLAY_WIDTH, maxHeight: "80%" } },
+			);
+			return result ?? null;
 		} catch {
 			return null;
 		}
@@ -495,6 +682,22 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
+	pi.on("context", async (event) => {
+		const filtered = event.messages.filter(
+			(m: any) => !(m.customType === WELCOME_TYPE),
+		);
+		return { messages: filtered };
+	});
+
+	pi.registerMessageRenderer(WELCOME_TYPE, {
+		renderMessage(event: any) {
+			const text = typeof event.message?.content === "string"
+				? event.message.content
+				: "";
+			return { lines: [{ text: `💬 ${text}` }] };
+		},
+	});
+
 	pi.on("before_agent_start", async (event) => {
 		if (!activeAgent || !activeAgent.prompt) return;
 		return {
@@ -502,7 +705,7 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
-	pi.registerCommand("agent", {
+	pi.registerCommand("switch-agent", {
 		description: "Switch main-session agent identity from ~/.pi/agent/agents/*.md, ~/.pi/agent/agents/*/AGENT.md, .pi/agents/*.md, or .pi/agents/*/AGENT.md",
 		getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
 			const candidates = [
