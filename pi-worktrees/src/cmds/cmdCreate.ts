@@ -1,0 +1,201 @@
+import type { ExtensionCommandContext } from '@mariozechner/pi-coding-agent';
+import { basename, join } from 'path';
+import { ensureExcluded, git, isGitRepo, listWorktrees } from '../services/git.ts';
+import { resolveLogfilePath, runHook, runOnCreateHook, sanitizePathPart, type HookProgressEvent } from './shared.ts';
+import type { CommandDeps, WorktreeCreatedContext } from '../types.ts';
+import { DefaultLogfileTemplate } from '../services/config/config.ts';
+import { parseCreateCommandArgs } from './createArgs.ts';
+import { generateBranchName } from '../services/branchNameGenerator.ts';
+import { expandTemplate } from '../services/templates.ts';
+import { withHookProgressPanel } from '../ui/hookProgressPanel.ts';
+
+function initialCreateHookEvent(
+  createdCtx: WorktreeCreatedContext,
+  hookValue: unknown,
+  logPath?: string
+): HookProgressEvent {
+  const templates = Array.isArray(hookValue) ? hookValue : hookValue ? [hookValue] : [];
+  const commands = templates.map((template) => expandTemplate(String(template), createdCtx));
+  return {
+    hookName: 'onCreate',
+    worktree: createdCtx,
+    commands,
+    states: commands.map(() => 'pending'),
+    outputs: commands.map(() => ({ stdout: '', stderr: '' })),
+    currentIndex: null,
+    logPath,
+    done: commands.length === 0,
+    success: commands.length === 0 ? true : undefined,
+  };
+}
+
+// TODO: this needs to be rethought so that we use configService.current(ctx.cwd)
+export async function cmdCreate(
+  args: string,
+  ctx: ExtensionCommandContext,
+  deps: CommandDeps
+): Promise<void> {
+  const parsed = parseCreateCommandArgs(args);
+  if ('error' in parsed) {
+    ctx.ui.notify(parsed.error, 'error');
+    return;
+  }
+
+  const worktreeName = parsed.worktreeName;
+  if (!isGitRepo(ctx.cwd)) {
+    ctx.ui.notify('Not in a git repository', 'error');
+    return;
+  }
+
+  const current = deps.configService.current(ctx);
+
+  let branchName = parsed.generate ? '' : parsed.branch;
+  if (parsed.generate) {
+    const generated = await generateBranchName({
+      commandTemplate: current.branchNameGenerator,
+      input: parsed.generatorInput,
+      cwd: ctx.cwd,
+    });
+
+    if (!generated.ok) {
+      ctx.ui.notify(generated.message, 'error');
+      return;
+    }
+
+    branchName = generated.branchName;
+    ctx.ui.notify(
+      `Using generated branch '${branchName}' from branchNameGenerator (input: '${parsed.generatorInput}').`,
+      'info'
+    );
+  }
+
+  if (!parsed.generate && parsed.showLegacyWarning) {
+    ctx.ui.notify(
+      `Legacy create style detected: '/worktree create <feature-name>' is deprecated. '${branchName}' is now treated as the branch name. If you want old semantics, run '/worktree create feature/${branchName}' (optionally '--name ${branchName}').`,
+      'warning'
+    );
+  }
+
+  const worktreePath = join(current.parentDir, worktreeName);
+
+  const existingWorktree = listWorktrees(ctx.cwd).find(
+    (worktree) =>
+      worktree.path === worktreePath ||
+      basename(worktree.path) === worktreeName ||
+      worktree.branch === branchName
+  );
+  if (existingWorktree) {
+    if (!ctx.hasUI) {
+      ctx.ui.notify(`Worktree already exists at: ${worktreePath}`, 'error');
+      return;
+    }
+
+    const confirmMessage = current.onSwitch
+      ? `Path: ${existingWorktree.path}\nBranch: ${existingWorktree.branch}\n\nSwitch to this worktree and run onSwitch?`
+      : `Path: ${existingWorktree.path}\nBranch: ${existingWorktree.branch}\n\nSwitch to this worktree?`;
+    const shouldSwitch = await ctx.ui.confirm('Worktree already exists', confirmMessage);
+
+    if (!shouldSwitch) {
+      ctx.ui.notify('Cancelled', 'info');
+      return;
+    }
+
+    const existingCtx: WorktreeCreatedContext = {
+      path: existingWorktree.path,
+      name: basename(existingWorktree.path),
+      branch: existingWorktree.branch,
+      ...current,
+    };
+
+    const sessionId = sanitizePathPart(ctx.sessionManager?.getSessionId?.() || 'session');
+    const safeName = sanitizePathPart(existingCtx.name);
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const logPath = resolveLogfilePath(current.logfile ?? DefaultLogfileTemplate, {
+      sessionId,
+      name: safeName,
+      timestamp,
+    });
+
+    const result = await withHookProgressPanel(
+      ctx,
+      { ...initialCreateHookEvent(existingCtx, current.onSwitch, logPath), hookName: 'onSwitch' },
+      (onProgress) => runHook(
+        existingCtx,
+        current.onSwitch,
+        'onSwitch',
+        ctx.ui.notify.bind(ctx.ui),
+        {
+          logPath,
+          displayOutputMaxLines: current.onCreateDisplayOutputMaxLines,
+          cmdDisplayPending: current.onCreateCmdDisplayPending,
+          cmdDisplaySuccess: current.onCreateCmdDisplaySuccess,
+          cmdDisplayError: current.onCreateCmdDisplayError,
+          cmdDisplayPendingColor: current.onCreateCmdDisplayPendingColor,
+          cmdDisplaySuccessColor: current.onCreateCmdDisplaySuccessColor,
+          cmdDisplayErrorColor: current.onCreateCmdDisplayErrorColor,
+          onProgress,
+        }
+      )
+    );
+
+    if (!result.success) {
+      ctx.ui.notify('onSwitch failed', 'error');
+      return;
+    }
+    ctx.ui.notify(`Worktree path: ${existingWorktree.path}`, 'info');
+    return;
+  }
+
+  try {
+    git(['rev-parse', '--verify', branchName], ctx.cwd);
+    ctx.ui.notify(`Branch '${branchName}' already exists. Use a different name.`, 'error');
+    return;
+  } catch {
+    // branch doesn't exist
+  }
+
+  ensureExcluded(ctx.cwd, current.parentDir);
+  const stopBusy = deps.statusService.busy(ctx, `Creating worktree: ${worktreeName}...`);
+  try {
+    git(['worktree', 'add', '-b', branchName, worktreePath], current.mainWorktree);
+    stopBusy();
+    deps.statusService.positive(ctx, `Created: ${worktreeName}`);
+  } catch (err) {
+    stopBusy();
+    deps.statusService.critical(ctx, `Failed to create worktree`);
+    ctx.ui.notify(`Failed to create worktree: ${(err as Error).message}`, 'error');
+    return;
+  }
+
+  const createdCtx: WorktreeCreatedContext = {
+    path: worktreePath,
+    name: worktreeName,
+    branch: branchName,
+    ...current,
+  };
+
+  const sessionId = sanitizePathPart(ctx.sessionManager?.getSessionId?.() || 'session');
+  const safeName = sanitizePathPart(worktreeName);
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const logPath = resolveLogfilePath(current.logfile ?? DefaultLogfileTemplate, {
+    sessionId,
+    name: safeName,
+    timestamp,
+  });
+
+  await withHookProgressPanel(
+    ctx,
+    initialCreateHookEvent(createdCtx, current.onCreate, logPath),
+    (onProgress) => runOnCreateHook(createdCtx, current, ctx.ui.notify.bind(ctx.ui), {
+      logPath,
+      displayOutputMaxLines: current.onCreateDisplayOutputMaxLines,
+      cmdDisplayPending: current.onCreateCmdDisplayPending,
+      cmdDisplaySuccess: current.onCreateCmdDisplaySuccess,
+      cmdDisplayError: current.onCreateCmdDisplayError,
+      cmdDisplayPendingColor: current.onCreateCmdDisplayPendingColor,
+      cmdDisplaySuccessColor: current.onCreateCmdDisplaySuccessColor,
+      cmdDisplayErrorColor: current.onCreateCmdDisplayErrorColor,
+      onProgress,
+    })
+  );
+}
