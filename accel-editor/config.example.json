@@ -1,0 +1,6 @@
+{
+  "enabled": false,
+  "arrowMaxMultiplier": 8,
+  "deleteMaxMultiplier": 2,
+  "repeatWindowMs": 120
+}

@@ -6,9 +6,15 @@ My personal pi coding agent extensions, managed via git and symlinked into `~/.p
 
 | Extension | Description |
 |-----------|-------------|
-| `agent-switcher/` | Agent switcher extension |
+| `accel-editor/` | Compact-panel-style input editor long-press acceleration |
+| `agent-orchestrator/` | Orchestrator role, CLI tools, and monitor UI |
+| `agent-run-time/` | Workflow command/runtime helpers |
 | `auto-trigger/` | Auto trigger extension |
-| `compact.ts` | Custom compaction extension |
+| `clear-context/` | Clear context panel and automation |
+| `compact-tailor/` | Custom compaction management panel |
+| `github-pr/` | GitHub PR helper extension |
+| `switch-agent/` | Agent switcher extension |
+| `todo.ts` | Todo helper extension |
 
 > Note: `subagent/` is a symlink to pi's built-in examples, not tracked here.
 
