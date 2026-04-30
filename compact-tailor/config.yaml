@@ -5,7 +5,7 @@
 
 threshold: 85
 summarize-model: zai/glm-4.7
-max-tokens: 4096
+max-tokens: 13107
 
 archive:
   enabled: false

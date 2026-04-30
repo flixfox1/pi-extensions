@@ -705,6 +705,71 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
+	// --- Quick dispatch: /agent-name [task] ---
+
+	// Cache agent names for fast lookup without hitting filesystem every keystroke
+	let cachedAgentNames: Set<string> | null = null;
+
+	function getAgentNameSet(cwd: string): Set<string> {
+		if (!cachedAgentNames) {
+			cachedAgentNames = new Set(discoverAgents(cwd).map((a) => a.name));
+		}
+		return cachedAgentNames;
+	}
+
+	pi.on("session_start", async () => {
+		cachedAgentNames = null; // invalidate on session change
+	});
+
+	pi.on("input", async (event, ctx) => {
+		// Skip extension-injected messages
+		if (event.source === "extension") return { action: "continue" };
+
+		// Match /agentName or /agentName task description
+		const match = event.text.match(/^\/(\S+)(?:\s+([\s\S]*))?$/);
+		if (!match) return { action: "continue" };
+
+		const [, agentName, task] = match;
+
+		// Don't intercept the /switch-agent command itself
+		if (agentName === "switch-agent") return { action: "continue" };
+
+		// Check if this name matches a known agent
+		const names = getAgentNameSet(ctx.cwd);
+		if (!names.has(agentName)) return { action: "continue" }; // not an agent, let prompt template handle it
+
+		// Handle /default as restore
+		if (agentName === "default") {
+			await switchToDefault(ctx, { persist: true, notify: true });
+			return { action: "handled" };
+		}
+
+		const agents = discoverAgents(ctx.cwd);
+		const agent = agents.find((a) => a.name === agentName);
+		if (!agent) return { action: "continue" }; // race condition guard
+
+		const hasTask = task && task.trim().length > 0;
+
+		if (hasTask) {
+			// Switch agent + send task as user message
+			await applyAgent(agent, ctx, {
+				persist: true,
+				notify: true,
+				captureFallback: !activeAgent,
+			});
+			pi.sendUserMessage(task.trim());
+		} else {
+			// No task: just switch to the agent directly
+			await applyAgent(agent, ctx, {
+				persist: true,
+				notify: true,
+				captureFallback: !activeAgent,
+			});
+		}
+
+		return { action: "handled" };
+	});
+
 	pi.registerCommand("switch-agent", {
 		description: "Switch main-session agent identity from ~/.pi/agent/agents/*.md, ~/.pi/agent/agents/*/AGENT.md, .pi/agents/*.md, or .pi/agents/*/AGENT.md",
 		getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {

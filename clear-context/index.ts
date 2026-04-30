@@ -30,7 +30,6 @@ const STATE_ENTRY_TYPE = "clear-context-state";
 const STATUS_ID = "clear-context";
 const DEFAULT_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
 const BUSY_RETRY_MS = 15 * 1000;
-const AUTO_CLEAR_COMMAND = "/clear --auto";
 
 // ──────────────────────────────────────────────────────────────────
 // Types
@@ -1017,7 +1016,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		ms.autoClearQueued = true;
-		pi.sendUserMessage(AUTO_CLEAR_COMMAND);
+		await runClear(ms.currentCtx, "auto", ms);
 	};
 
 	// ─── 事件监听 ────────────────────────────────────────────────
