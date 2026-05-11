@@ -964,7 +964,7 @@ export default function (pi: ExtensionAPI) {
 			const elapsed = Date.now() - ms.lastActivityAt;
 			const delay = Math.max(0, ms.state.idleTimeoutMs - elapsed);
 			ms.timer = setTimeout(() => {
-				void maybeAutoClear();
+				void safeAutoClear();
 			}, delay);
 			ms.updateStatus(ctx);
 		},
@@ -991,7 +991,27 @@ export default function (pi: ExtensionAPI) {
 		},
 	};
 
-	const maybeAutoClear = async () => {
+	// ─── auto-clear 安全执行链 ──────────────────────────────────
+
+	/**
+	 * 安全包装：捕获 auto-clear timer 链中的所有异常，
+	 * 防止 unhandled rejection crash。
+	 */
+	const safeAutoClear = async () => {
+		try {
+			await maybeAutoClearCore();
+		} catch (err) {
+			// session 可能已 shutdown，静默忽略
+			if (!ms.shuttingDown) {
+				console.error("[clear-context] auto-clear error:", err);
+			}
+		}
+	};
+
+	/**
+	 * maybeAutoClear 核心逻辑（无 try-catch，由 safeAutoClear 包装）
+	 */
+	const maybeAutoClearCore = async () => {
 		if (
 			ms.shuttingDown ||
 			!ms.state.enabled ||
@@ -999,24 +1019,30 @@ export default function (pi: ExtensionAPI) {
 			ms.autoClearQueued
 		)
 			return;
-		if (
-			!ms.currentCtx.isIdle() ||
-			ms.currentCtx.hasPendingMessages()
-		) {
-			if (ms.timer !== null) clearTimeout(ms.timer);
-			ms.timer = setTimeout(() => {
-				void maybeAutoClear();
-			}, BUSY_RETRY_MS);
-			ms.updateStatus(ms.currentCtx);
+
+		const ctx = ms.currentCtx;
+
+		// 二次验证：确保 context 仍然有效
+		if (typeof ctx.isIdle !== "function") {
+			ms.scheduleAutoClear(null);
 			return;
 		}
-		if (isClean(ms.currentCtx)) {
-			ms.updateStatus(ms.currentCtx);
-			ms.scheduleAutoClear(ms.currentCtx);
+
+		if (!ctx.isIdle() || ctx.hasPendingMessages()) {
+			if (ms.timer !== null) clearTimeout(ms.timer);
+			ms.timer = setTimeout(() => {
+				void safeAutoClear();
+			}, BUSY_RETRY_MS);
+			ms.updateStatus(ctx);
+			return;
+		}
+		if (isClean(ctx)) {
+			ms.updateStatus(ctx);
+			ms.scheduleAutoClear(ctx);
 			return;
 		}
 		ms.autoClearQueued = true;
-		await runClear(ms.currentCtx, "auto", ms);
+		await runClear(ctx, "auto", ms);
 	};
 
 	// ─── 事件监听 ────────────────────────────────────────────────

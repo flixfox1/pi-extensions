@@ -15,39 +15,89 @@ export interface ParsedOutput {
 
 // ── Prompt ────────────────────────────────────────────────────────
 
-const BASE_PROMPT = `You are a conversation summarizer. Create a comprehensive summary of this conversation that captures:
+const BASE_PROMPT = `You are a compaction summarizer for a coding-agent session.
+Your output will replace older conversation history after context compaction.
+The next agent will only see this summary plus the recent unsummarized messages, so preserve the execution state precisely.
 
-1. The main goals and objectives discussed
-2. Key decisions made and their rationale
-3. Important code changes, file modifications, or technical details
-4. Current state of any ongoing work (CRITICAL — include file paths, function names, variable states)
-5. Any blockers, issues, or open questions
-6. Next steps that were planned or suggested (CRITICAL)
+Write the summary in this exact Markdown structure:
 
-Be thorough but concise. The summary will replace the ENTIRE conversation history, so include all information needed to continue the work effectively.
-Format the summary as structured markdown with clear section headers.`;
+## Goal
+[User's current goal. Include multiple goals only if still relevant.]
+
+## Constraints & Preferences
+- [User-stated constraints, preferences, or requirements]
+- [Use "(none)" if none are known]
+
+## Progress
+### Done
+- [x] [Completed work, decisions, files changed, commands/tests run]
+
+### In Progress
+- [ ] [The active task at the time of compaction, with concrete current state]
+
+### Blocked
+- [Blockers, failed commands, missing decisions, rate limits, or "(none)"]
+
+## Key Decisions
+- **[Decision]**: [Reason / evidence]
+
+## Next Steps
+1. [Concrete next action]
+2. [Validation or follow-up action]
+
+## Critical Context
+- [Facts needed to continue without rereading the whole conversation]
+- [Exact file paths, function names, config values, command outputs, error text]
+
+<read-files>
+path/or/none
+</read-files>
+
+<modified-files>
+path/or/none
+</modified-files>
+
+Rules:
+- Be concise but not lossy; prefer exact paths, symbols, config keys, commands, and error messages.
+- Preserve unresolved user intent and the latest execution state.
+- Do not invent completed work.
+- Do not include conversational filler or meta commentary about summarization.`;
 
 const DYNAMIC_APPENDIX = `
 
-## Continuation Instruction (Required)
+## Continuation Contract (Required)
 
-After the summary, you MUST output a section titled exactly \`## Continuation\`.
+After the summary, output a final section titled exactly:
 
-Analyze the last user intent and tool calling results in the conversation.
-Generate a single direct instruction for the agent to resume work.
-Reference specific files and states from the conversation.
-No preamble — output the instruction directly.
+## Continuation
 
-If the task is fully complete with no remaining work, output: TASK_COMPLETE`;
+The continuation is a single user-facing instruction that will be automatically sent to the next agent after compaction.
+It must let the agent resume safely from the compacted state.
 
-const CONTINUATION_MARKER = "## Continuation";
+Continuation rules:
+- Output only the instruction text under \`## Continuation\`; no bullets unless bullets are necessary for clarity.
+- Make it executable: say what to do next, where to look, what files/configs matter, and how to validate.
+- Do not ask the agent to repeat work already marked Done.
+- Do not say vague things like "continue the task" without concrete next actions.
+- If the user was asking for analysis rather than code, instruct the agent to answer or continue that analysis, not to edit files.
+- If the task is blocked, instruct the agent to report the blocker and request the specific missing input.
+- If there is truly no remaining work, output exactly: TASK_COMPLETE`;
+
+const CONTINUATION_MARKER_RE = /(?:^|\n)#{1,6}\s*Continuation(?:\s+Instruction)?\s*$/gim;
 
 export function parseCompactionOutput(raw: string): ParsedOutput {
-	const idx = raw.lastIndexOf(CONTINUATION_MARKER);
-	if (idx === -1) return { summary: raw.trim(), continuation: null };
+	let last: RegExpExecArray | null = null;
+	for (let match = CONTINUATION_MARKER_RE.exec(raw); match; match = CONTINUATION_MARKER_RE.exec(raw)) {
+		last = match;
+	}
+	CONTINUATION_MARKER_RE.lastIndex = 0;
+
+	if (!last) return { summary: raw.trim(), continuation: null };
+	const markerStart = last.index + (last[0].startsWith("\n") ? 1 : 0);
+	const continuationStart = last.index + last[0].length;
 	return {
-		summary: raw.slice(0, idx).trim(),
-		continuation: raw.slice(idx + CONTINUATION_MARKER.length).trim() || null,
+		summary: raw.slice(0, markerStart).trim(),
+		continuation: raw.slice(continuationStart).trim() || null,
 	};
 }
 
@@ -92,11 +142,40 @@ export async function generateCompaction(
 		}],
 	}, { apiKey: auth.apiKey, headers: auth.headers, maxTokens: config.maxTokens, signal });
 
-	const raw = response.content
+	if (response.stopReason === "error") {
+		throw new Error(`LLM error from ${model.provider}/${model.id}: ${response.errorMessage ?? "unknown error"}`);
+	}
+	if (response.stopReason === "aborted") {
+		throw new Error(`LLM request aborted for ${model.provider}/${model.id}`);
+	}
+
+	const text = response.content
 		.filter((c): c is { type: "text"; text: string } => c.type === "text")
 		.map((c) => c.text)
 		.join("\n");
-	if (!raw.trim()) throw new Error("LLM output was empty");
+	const thinking = response.content
+		.filter((c): c is { type: "thinking"; thinking: string } => c.type === "thinking")
+		.map((c) => c.thinking)
+		.join("\n");
+	const raw = text.trim() ? text : thinking;
+	if (!raw.trim()) {
+		const blockTypes = response.content.map((c) => c.type).join(",") || "none";
+		const usage = response.usage ? ` input=${response.usage.input} output=${response.usage.output} total=${response.usage.totalTokens}` : "";
+		throw new Error(`LLM output was empty (model=${model.provider}/${model.id}, stopReason=${response.stopReason}, blocks=${blockTypes},${usage})`);
+	}
+	if (!text.trim() && thinking.trim()) {
+		try {
+			if ((ctx as any).hasUI) (ctx as any).ui.notify("⚠️ summarizer returned thinking-only output; using it as fallback", "warning");
+			else console.log("[compact:warning] summarizer returned thinking-only output; using it as fallback");
+		} catch { /* notification best effort */ }
+	}
 
-	return parseCompactionOutput(raw);
+	const parsed = parseCompactionOutput(raw);
+	if (config.dynamicInstruction.enabled && !parsed.continuation) {
+		try {
+			if ((ctx as any).hasUI) (ctx as any).ui.notify("⚠️ dynamic continuation marker missing; compaction will finish without auto-resume", "warning");
+			else console.log("[compact:warning] dynamic continuation marker missing; compaction will finish without auto-resume");
+		} catch { /* notification best effort */ }
+	}
+	return parsed;
 }

@@ -31,6 +31,8 @@ interface AccelConfig {
 	enabled: boolean;
 	arrowMaxMultiplier: number;
 	deleteMaxMultiplier: number;
+	scrollMaxMultiplier: number;
+	forceMouseTracking: boolean;
 	repeatWindowMs: number;
 }
 
@@ -38,12 +40,15 @@ const DEFAULTS: AccelConfig = {
 	enabled: false,
 	arrowMaxMultiplier: 8,
 	deleteMaxMultiplier: 2,
+	scrollMaxMultiplier: 4,
+	forceMouseTracking: false,
 	repeatWindowMs: 120,
 };
 
 const STATUS_ID = "accel-editor";
 const ARROW_VALUES = [1, 2, 4, 8, 12] as const;
 const DELETE_VALUES = [1, 2, 4] as const;
+const SCROLL_VALUES = [1, 2, 4, 6, 8] as const;
 const WINDOW_VALUES = [80, 100, 120, 160, 200] as const;
 
 const OVERLAY = {
@@ -82,6 +87,9 @@ function loadConfig(): AccelConfig {
 		enabled: typeof raw.enabled === "boolean" ? raw.enabled : DEFAULTS.enabled,
 		arrowMaxMultiplier: clampInt(raw.arrowMaxMultiplier, DEFAULTS.arrowMaxMultiplier, 1, 12),
 		deleteMaxMultiplier: clampInt(raw.deleteMaxMultiplier, DEFAULTS.deleteMaxMultiplier, 1, 4),
+		scrollMaxMultiplier: clampInt(raw.scrollMaxMultiplier, DEFAULTS.scrollMaxMultiplier, 1, 8),
+		// macOS/tmux safety: never auto-enable terminal mouse capture from config.
+		forceMouseTracking: false,
 		repeatWindowMs: clampInt(raw.repeatWindowMs, DEFAULTS.repeatWindowMs, 40, 500),
 	};
 }
@@ -97,6 +105,9 @@ function updateConfig(patch: Partial<AccelConfig>): AccelConfig {
 		enabled: next.enabled,
 		arrowMaxMultiplier: clampInt(next.arrowMaxMultiplier, DEFAULTS.arrowMaxMultiplier, 1, 12),
 		deleteMaxMultiplier: clampInt(next.deleteMaxMultiplier, DEFAULTS.deleteMaxMultiplier, 1, 4),
+		scrollMaxMultiplier: clampInt(next.scrollMaxMultiplier, DEFAULTS.scrollMaxMultiplier, 1, 8),
+		// macOS/tmux safety: terminal mouse capture is disabled.
+		forceMouseTracking: false,
 		repeatWindowMs: clampInt(next.repeatWindowMs, DEFAULTS.repeatWindowMs, 40, 500),
 	};
 	saveConfig(normalized);
@@ -113,6 +124,16 @@ function cycleValue(values: readonly number[], current: number): number {
 	return values[(idx + 1) % values.length] ?? values[0]!;
 }
 
+let mouseTrackingActive = false;
+
+function setTerminalMouseTracking(enabled: boolean): void {
+	if (!process.stdout.isTTY || mouseTrackingActive === enabled) return;
+	mouseTrackingActive = enabled;
+	// 1000 = normal mouse tracking, 1006 = SGR mouse encoding.
+	// Disabling also clears 1002/1003 in case a terminal/tmux upgraded the mode.
+	process.stdout.write(enabled ? "\x1b[?1000h\x1b[?1006h" : "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l");
+}
+
 function getRepeatMultiplier(repeatCount: number, maxMultiplier: number): number {
 	let target = 1;
 	if (repeatCount > 45) target = 12;
@@ -124,6 +145,45 @@ function getRepeatMultiplier(repeatCount: number, maxMultiplier: number): number
 
 function isArrowKey(data: string): boolean {
 	return matchesKey(data, Key.left) || matchesKey(data, Key.right) || matchesKey(data, Key.up) || matchesKey(data, Key.down);
+}
+
+// ── Scroll wheel detection ─────────────────────────────
+// Three common mouse protocol encodings for scroll wheel:
+//
+//   SGR extended:   \x1b[<64;col;rowM  /  \x1b[<65;col;rowM
+//                    (button 64 = scroll up, 65 = scroll down)
+//
+//   X11 extended:   \x1b[M`ab          /  \x1b[Maab
+//                    (chr(64+32)='`'  / chr(65+32)='a')
+//
+//   X11 basic:      \x1b[M$ab          /  \x1b[M%ab
+//                    (chr(4+32)='$'   / chr(5+32)='%')
+//                    ← tmux 内层默认使用此格式
+//
+// X11 prefixes only match first 3 bytes; coordinates follow but are ignored.
+const RE_SCROLL_UP_SGR = /^\x1b\[<64;\d+;\d+M$/;
+const RE_SCROLL_DN_SGR = /^\x1b\[<65;\d+;\d+M$/;
+const RE_SCROLL_UP_X11_EXT = /^\x1b\[M`/;
+const RE_SCROLL_DN_X11_EXT = /^\x1b\[Ma/;
+const RE_SCROLL_UP_X11_BASIC = /^\x1b\[M\$/;
+const RE_SCROLL_DN_X11_BASIC = /^\x1b\[M%/;
+const RE_MOUSE_SGR = /^\x1b\[<\d+;\d+;\d+[mM]$/;
+const RE_MOUSE_X11 = /^\x1b\[M[\s\S]{3}/;
+
+function isMouseEvent(data: string): boolean {
+	return RE_MOUSE_SGR.test(data) || RE_MOUSE_X11.test(data);
+}
+
+function isScrollUp(data: string): boolean {
+	return RE_SCROLL_UP_SGR.test(data)
+		|| RE_SCROLL_UP_X11_EXT.test(data)
+		|| RE_SCROLL_UP_X11_BASIC.test(data);
+}
+
+function isScrollDown(data: string): boolean {
+	return RE_SCROLL_DN_SGR.test(data)
+		|| RE_SCROLL_DN_X11_EXT.test(data)
+		|| RE_SCROLL_DN_X11_BASIC.test(data);
 }
 
 function isDeleteKey(data: string): boolean {
@@ -144,6 +204,19 @@ class AcceleratedEditor extends CustomEditor {
 
 		const arrow = isArrowKey(data);
 		const del = isDeleteKey(data);
+		const mouse = isMouseEvent(data);
+
+		// Mouse wheel/click events must not be translated into editor up/down.
+		// On macOS/tmux that hijacks normal history scrolling and instead cycles
+		// the prompt input history. Pass mouse events through unchanged so Pi/tmux
+		// can handle scrolling in their normal path.
+		if (mouse) {
+			this.lastKey = "";
+			this.repeatCount = 0;
+			super.handleInput(data);
+			return;
+		}
+
 		if (!arrow && !del) {
 			this.lastKey = "";
 			this.repeatCount = 0;
@@ -167,6 +240,7 @@ class AcceleratedEditor extends CustomEditor {
 }
 
 function applyRuntime(ctx: ExtensionContext, cfg = loadConfig()): void {
+	setTerminalMouseTracking(cfg.enabled && cfg.forceMouseTracking);
 	if (!ctx.hasUI) return;
 
 	if (cfg.enabled) {
@@ -341,8 +415,12 @@ export default function (pi: ExtensionAPI): void {
 		applyRuntime(ctx, loadConfig());
 	});
 
+	pi.on("session_shutdown", () => {
+		setTerminalMouseTracking(false);
+	});
+
 	pi.registerCommand("accel-editor", {
-		description: "Accel Editor 主面板: 长按方向键/删除键加速",
+		description: "Accel Editor 主面板: 长按方向键/删除键/滚轮加速",
 		getArgumentCompletions: (prefix: string) => {
 			const items = SUB_COMMANDS
 				.filter((s) => s.startsWith(prefix.trim()))
@@ -422,6 +500,7 @@ export default function (pi: ExtensionAPI): void {
 				notify(ctx, `Delete Max: ${next.deleteMaxMultiplier}x`, "success");
 				return;
 			}
+
 
 			if (sub === "window" || sub.startsWith("window ")) {
 				const raw = sub.slice("window".length).trim();

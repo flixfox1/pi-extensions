@@ -44,4 +44,8 @@ Use `config.example.json` as a reference.
 
 - Arrow keys can safely use higher multipliers.
 - Delete acceleration is capped lower to reduce accidental large deletions.
-- The plugin accelerates repeated terminal key events; it does not change OS-level keyboard repeat settings.
+- Mouse wheel events are intentionally not accelerated at the input-editor layer.
+  Translating wheel events into up/down keys conflicts with macOS/tmux scrolling and
+  cycles the prompt input history instead of scrolling conversation/terminal history.
+- The plugin accelerates repeated terminal key events; it does not change OS-level
+  keyboard repeat settings.

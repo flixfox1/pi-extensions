@@ -21,10 +21,18 @@ export interface StaticInstructionConfig {
 	file?: string;
 }
 
+export interface AutoTriggerConfig {
+	enabled: boolean;
+	softThreshold: number;
+	dangerThreshold: number;
+}
+
 export interface CompactConfig {
+	/** Trigger threshold percentage. Kept top-level for backward compatibility. */
 	threshold: number;
 	summarizeModel: string;
 	maxTokens: number;
+	auto: AutoTriggerConfig;
 	archive: ArchiveConfig;
 	dynamicInstruction: DynamicInstructionConfig;
 	staticInstruction: StaticInstructionConfig;
@@ -34,6 +42,7 @@ const DEFAULTS: CompactConfig = {
 	threshold: 85,
 	summarizeModel: "zai/glm-4.7",
 	maxTokens: 13107,  // 对齐 Pi 内置: Math.floor(0.8 * 16384)
+	auto: { enabled: true, softThreshold: 80, dangerThreshold: 92 },
 	archive: { enabled: true, dir: ".pi/compaction-archives" },
 	dynamicInstruction: { enabled: true },
 	staticInstruction: { enabled: false, content: "" },
@@ -116,14 +125,21 @@ export function loadConfig(): CompactConfig {
 	let raw: YamlNode = {};
 	try { raw = parseYaml(fs.readFileSync(getConfigPath(), "utf-8")); } catch { /* */ }
 
+	const auto = raw.auto as YamlNode | undefined;
 	const a = raw.archive as YamlNode | undefined;
 	const d = raw["dynamic-instruction"] as YamlNode | undefined;
 	const s = raw["static-instruction"] as YamlNode | undefined;
+	const threshold = num(raw.threshold, num(auto?.threshold, DEFAULTS.threshold));
 
 	return {
-		threshold: num(raw.threshold, DEFAULTS.threshold),
+		threshold,
 		summarizeModel: str((raw as any)["summarize-model"], str((raw as any).summarizeModel, DEFAULTS.summarizeModel)),
 		maxTokens: num((raw as any)["max-tokens"], num((raw as any).maxTokens, DEFAULTS.maxTokens)),
+		auto: {
+			enabled: bool(auto?.enabled, DEFAULTS.auto.enabled),
+			softThreshold: num((auto as any)?.["soft-threshold"], num((auto as any)?.softThreshold, Math.max(0, threshold - 5))),
+			dangerThreshold: num((auto as any)?.["danger-threshold"], num((auto as any)?.dangerThreshold, Math.min(99, threshold + 7))),
+		},
 		archive: { enabled: bool(a?.enabled, DEFAULTS.archive.enabled), dir: str(a?.dir, DEFAULTS.archive.dir) },
 		dynamicInstruction: { enabled: bool(d?.enabled, DEFAULTS.dynamicInstruction.enabled) },
 		staticInstruction: { enabled: bool(s?.enabled, DEFAULTS.staticInstruction.enabled), content: str(s?.content, DEFAULTS.staticInstruction.content), file: s?.file ? str(s?.file, "") : undefined },

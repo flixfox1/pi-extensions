@@ -5,16 +5,21 @@
 
 threshold: 85
 summarize-model: zai/glm-4.7
-max-tokens: 13107
+max-tokens: 8192
+
+auto:
+  enabled: true
+  soft-threshold: 80
+  danger-threshold: 92
 
 archive:
   enabled: false
   dir: .pi/compaction-archives
 
 dynamic-instruction:
-  enabled: false
+  enabled: true
 
 static-instruction:
   enabled: false
-  content: "wait for my instruction"
+  content: "Loop it again"
   # file: ""
