@@ -1,9 +1,9 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import type { ExtensionAPI, ExtensionContext } from '@mariozechner/pi-coding-agent';
 import { getSettingsListTheme } from '@mariozechner/pi-coding-agent';
-import { Container, SettingsList, truncateToWidth, type SettingItem } from '@mariozechner/pi-tui';
+import { Container, Key, matchesKey, SettingsList, truncateToWidth, type SettingItem } from '@mariozechner/pi-tui';
 
 type DeliveryMode = 'notify-only' | 'auto-turn';
 type PrState = 'OPEN' | 'CLOSED' | 'MERGED' | 'UNKNOWN';
@@ -131,6 +131,14 @@ const EVENT_ACTION_DESCRIPTIONS: Record<EventAction, string> = {
     discovered: 'discovered — inferred non-open first sighting',
     state_changed: 'state_changed — fallback state transition',
 };
+
+const ENV_FILE_SAVE_PATH = path.join(homedir(), '.pi', 'agent', 'extensions', 'github-pr', '.env');
+const SAVED_ENV_KEYS = [
+    'PI_GH_PR_MODE',
+    'PI_GH_PR_EVENT_ACTIONS',
+    'PI_GH_PR_MESSAGE_FIELDS',
+    'PI_GH_PR_INSTRUCTION',
+] as const;
 
 loadEnvFiles([
     getEnv('PI_GH_PR_ENV_FILE', 'MATELINK_GH_PR_ENV_FILE'),
@@ -482,6 +490,46 @@ export default function githubPrCliExtension(pi: ExtensionAPI) {
         });
     }
 
+    function saveToEnvFile(): { ok: boolean; message: string } {
+        const values: Record<string, string> = {
+            'PI_GH_PR_MODE': mode,
+            'PI_GH_PR_EVENT_ACTIONS': formatEventActionFilter(eventActions),
+            'PI_GH_PR_MESSAGE_FIELDS': formatMessageFieldFilter(messageFields),
+            'PI_GH_PR_INSTRUCTION': instruction,
+        };
+
+        let content: string;
+        try {
+            content = existsSync(ENV_FILE_SAVE_PATH) ? readFileSync(ENV_FILE_SAVE_PATH, 'utf8') : '';
+        } catch {
+            content = '';
+        }
+
+        const lines = content.split(/\r?\n/);
+        const updatedKeys = new Set<string>();
+
+        for (let i = 0; i < lines.length; i++) {
+            const match = lines[i].match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/);
+            if (match && match[1] in values) {
+                lines[i] = `${match[1]}=${values[match[1]]}`;
+                updatedKeys.add(match[1]);
+            }
+        }
+
+        for (const key of SAVED_ENV_KEYS) {
+            if (!updatedKeys.has(key)) {
+                lines.push(`${key}=${values[key]}`);
+            }
+        }
+
+        try {
+            writeFileSync(ENV_FILE_SAVE_PATH, lines.join('\n') + '\n');
+            return { ok: true, message: `Configuration saved to ${ENV_FILE_SAVE_PATH}` };
+        } catch (error) {
+            return { ok: false, message: `Failed to save: ${summarizeError(error)}` };
+        }
+    }
+
     function colorize(color: 'success' | 'warning' | 'error' | 'dim' | 'accent', text: string): string {
         const theme = ctxRef?.ui?.theme;
         if (!theme?.fg) return text;
@@ -752,12 +800,19 @@ export default function githubPrCliExtension(pi: ExtensionAPI) {
                     }
 
                     lines.push('');
+                    lines.push(truncateToWidth(theme.fg('muted', 'Ctrl+S = save to defaults'), width));
                     lines.push(truncateToWidth(theme.fg('text', theme.bold('Press Esc or Enter to close')), width));
 
                     return lines;
                 },
                 invalidate() {},
                 handleInput(data: string) {
+                    if (matchesKey(data, Key.ctrl('s'))) {
+                        const result = saveToEnvFile();
+                        notify(result.message, result.ok ? 'info' : 'error');
+                        tui.requestRender();
+                        return;
+                    }
                     if (kb.matches(data, 'tui.select.cancel') || kb.matches(data, 'tui.select.confirm')) {
                         done(undefined);
                     }
@@ -791,7 +846,7 @@ export default function githubPrCliExtension(pi: ExtensionAPI) {
                             truncateToWidth(theme.fg('accent', theme.bold('GitHub PR Event Filter')), width),
                             '',
                             truncateToWidth(theme.fg('muted', 'Choose which PR event types trigger notifications.'), width),
-                            truncateToWidth(theme.fg('muted', 'Changes apply immediately.'), width),
+                            truncateToWidth(theme.fg('muted', 'Changes apply immediately. Ctrl+S = save to defaults'), width),
                             '',
                         ];
                     }
@@ -829,6 +884,12 @@ export default function githubPrCliExtension(pi: ExtensionAPI) {
                     container.invalidate();
                 },
                 handleInput(data: string) {
+                    if (matchesKey(data, Key.ctrl('s'))) {
+                        const result = saveToEnvFile();
+                        notify(result.message, result.ok ? 'info' : 'error');
+                        tui.requestRender();
+                        return;
+                    }
                     settingsList.handleInput?.(data);
                     tui.requestRender();
                 },
@@ -894,7 +955,7 @@ export default function githubPrCliExtension(pi: ExtensionAPI) {
                             truncateToWidth(theme.fg('accent', theme.bold('GitHub PR Message Fields')), width),
                             '',
                             truncateToWidth(theme.fg('muted', 'Choose which PR fields appear in the event message.'), width),
-                            truncateToWidth(theme.fg('muted', 'Changes apply immediately.'), width),
+                            truncateToWidth(theme.fg('muted', 'Changes apply immediately. Ctrl+S = save to defaults'), width),
                             '',
                         ];
                     }
@@ -932,6 +993,12 @@ export default function githubPrCliExtension(pi: ExtensionAPI) {
                     container.invalidate();
                 },
                 handleInput(data: string) {
+                    if (matchesKey(data, Key.ctrl('s'))) {
+                        const result = saveToEnvFile();
+                        notify(result.message, result.ok ? 'info' : 'error');
+                        tui.requestRender();
+                        return;
+                    }
                     settingsList.handleInput?.(data);
                     tui.requestRender();
                 },
@@ -1008,7 +1075,7 @@ export default function githubPrCliExtension(pi: ExtensionAPI) {
                             '',
                             truncateToWidth(theme.fg('muted', instruction || '(no instruction set)'), width),
                             '',
-                            truncateToWidth(theme.fg('muted', 'Type below. Enter = confirm, Esc = cancel. Clear text to remove.'), width),
+                            truncateToWidth(theme.fg('muted', 'Enter = confirm, Esc = cancel, Ctrl+S = save to defaults'), width),
                             '',
                         ];
                     }
@@ -1106,6 +1173,12 @@ export default function githubPrCliExtension(pi: ExtensionAPI) {
                     container.invalidate();
                 },
                 handleInput(data: string) {
+                    if (matchesKey(data, Key.ctrl('s'))) {
+                        const result = saveToEnvFile();
+                        notify(result.message, result.ok ? 'info' : 'error');
+                        tui.requestRender();
+                        return;
+                    }
                     inputComp.handleInput(data);
                 },
             };

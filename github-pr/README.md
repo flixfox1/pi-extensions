@@ -111,6 +111,18 @@ PI_GH_PR_GH_BIN=gh
 
 ---
 
+## Keyboard shortcut
+
+### `Ctrl+S` — Save to defaults
+
+Available inside all `/gh-pr` interactive screens (status, events, fields, instruction).
+
+Pressing `Ctrl+S` writes the **current runtime configuration** (mode, event actions, message fields, instruction) to `~/.pi/agent/extensions/github-pr/.env` so that new Pi sessions inherit these values as defaults.
+
+The file is updated in-place — existing env keys not managed by the extension are left untouched.
+
+---
+
 ## Commands
 
 ### `/gh-pr start`
@@ -204,6 +216,20 @@ Example:
 ```text
 /gh-pr fields pr,title,author,url
 ```
+
+### `/gh-pr fields repo,event,pr,title,...`
+Set an explicit list of fields to include.
+
+Example:
+
+```text
+/gh-pr fields pr,title,author,url
+```
+
+### Ctrl+S in fields screen
+Save current field selection to `~/.pi/agent/extensions/github-pr/.env` as new-session defaults.
+
+---
 
 ### `/gh-pr instruction`
 Opens a dialog to set, view, or clear a custom instruction.
