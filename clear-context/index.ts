@@ -19,8 +19,8 @@ import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
-} from "@mariozechner/pi-coding-agent";
-import { truncateToWidth, matchesKey, Key } from "@mariozechner/pi-tui";
+} from "@earendil-works/pi-coding-agent";
+import { truncateToWidth, matchesKey, Key } from "@earendil-works/pi-tui";
 
 // ──────────────────────────────────────────────────────────────────
 // Constants
@@ -30,6 +30,7 @@ const STATE_ENTRY_TYPE = "clear-context-state";
 const STATUS_ID = "clear-context";
 const DEFAULT_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
 const BUSY_RETRY_MS = 15 * 1000;
+const GLOBAL_COMMAND_CTX_KEY = "__piClearContextCommandCtx";
 
 // ──────────────────────────────────────────────────────────────────
 // Types
@@ -39,6 +40,11 @@ type PersistedState = {
 	enabled: boolean;
 	lastClearAt: number | null;
 	idleTimeoutMs: number;
+	/**
+	 * Legacy plugin-only cutoff from older versions. New auto-clear uses
+	 * ctx.newSession() so Pi core context usage is truly reset.
+	 */
+	contextCutoffAt: number | null;
 };
 
 type SessionEntryLike = {
@@ -65,10 +71,15 @@ type MigratedState = {
 	thinkingLevel?: string;
 };
 
+type GlobalWithCommandContext = typeof globalThis & {
+	[GLOBAL_COMMAND_CTX_KEY]?: ExtensionCommandContext;
+};
+
 const DEFAULT_STATE: PersistedState = {
 	enabled: false,
 	lastClearAt: null,
 	idleTimeoutMs: DEFAULT_IDLE_TIMEOUT_MS,
+	contextCutoffAt: null,
 };
 
 // ──────────────────────────────────────────────────────────────────
@@ -129,6 +140,15 @@ const formatIdleTimeout = (ms: number): string => {
 	return `${minutes}m`;
 };
 
+const toTimestampMs = (value: unknown): number | null => {
+	if (typeof value === "number" && Number.isFinite(value)) return value;
+	if (typeof value === "string") {
+		const parsed = Date.parse(value);
+		return Number.isFinite(parsed) ? parsed : null;
+	}
+	return null;
+};
+
 // ──────────────────────────────────────────────────────────────────
 // 共用 overlay 选项
 // ──────────────────────────────────────────────────────────────────
@@ -187,6 +207,20 @@ const notify = (
 	else console.log(`[clear-context:${level}] ${msg}`);
 };
 
+const rememberCommandContext = (ctx: ExtensionCommandContext): void => {
+	(globalThis as GlobalWithCommandContext)[GLOBAL_COMMAND_CTX_KEY] = ctx;
+};
+
+const getRememberedCommandContext = (): ExtensionCommandContext | null =>
+	(globalThis as GlobalWithCommandContext)[GLOBAL_COMMAND_CTX_KEY] ?? null;
+
+const clearRememberedCommandContext = (ctx?: ExtensionCommandContext): void => {
+	const global = globalThis as GlobalWithCommandContext;
+	if (!ctx || global[GLOBAL_COMMAND_CTX_KEY] === ctx) {
+		delete global[GLOBAL_COMMAND_CTX_KEY];
+	}
+};
+
 // ──────────────────────────────────────────────────────────────────
 // Menu items 定义
 // ──────────────────────────────────────────────────────────────────
@@ -204,10 +238,10 @@ type MenuId = typeof MENU_ITEMS[number]["id"];
 // ──────────────────────────────────────────────────────────────────
 
 async function showMainMenu(
-	pi: ExtensionAPI,
-	ctx: ExtensionContext,
+	ctx: ExtensionCommandContext,
 	moduleState: ModuleState,
 ): Promise<void> {
+	rememberCommandContext(ctx);
 	if (!ctx.hasUI) {
 		notify(
 			ctx,
@@ -243,9 +277,10 @@ async function showMainMenu(
 					const autoVal = moduleState.state.enabled
 						? theme.fg("success", "✓ enabled")
 						: theme.fg("dim", "✗ disabled");
-					const contextVal = isClean(ctx)
+					const contextCount = getContextTokenCount(ctx);
+					const contextVal = contextCount === 0
 						? theme.fg("success", "clean (0)")
-						: theme.fg("warning", `${getContextTokenCount(ctx)} tokens`);
+						: theme.fg("warning", `${contextCount} tokens`);
 					const idleVal = moduleState.state.enabled
 						? theme.fg(
 								"dim",
@@ -361,7 +396,7 @@ async function showMainMenu(
 		}
 
 		if (result === "clear") {
-			await runClear(ctx, "manual", moduleState);
+			await runClear(ctx, moduleState);
 			active = false;
 		} else if (result === "auto") {
 			await handleAutoClear(ctx, moduleState);
@@ -376,9 +411,10 @@ async function showMainMenu(
 // ──────────────────────────────────────────────────────────────────
 
 async function handleAutoClear(
-	ctx: ExtensionContext,
+	ctx: ExtensionCommandContext,
 	moduleState: ModuleState,
 ): Promise<void> {
+	rememberCommandContext(ctx);
 	if (!ctx.hasUI) {
 		notify(ctx, "仅支持 TUI 模式", "warning");
 		return;
@@ -417,7 +453,7 @@ async function handleAutoClear(
 					borderLine(
 						theme.fg(
 							"muted",
-							"开启后新 session 自动开始倒计时",
+							"开启后自动开始倒计时，不依赖 pi core 命令转发",
 						),
 						W,
 						theme,
@@ -762,7 +798,6 @@ interface ModuleState {
 	lastActivityAt: number;
 	currentCtx: ExtensionContext | null;
 	shuttingDown: boolean;
-	autoClearQueued: boolean;
 	timer: ReturnType<typeof setTimeout> | null;
 
 	persistOwnState: () => void;
@@ -830,15 +865,14 @@ const collectMigratedState = (
 
 const runClear = async (
 	ctx: ExtensionCommandContext,
-	source: "manual" | "auto",
 	moduleState: ModuleState,
 ) => {
+	rememberCommandContext(ctx);
 	moduleState.touch(ctx);
-	moduleState.autoClearQueued = false;
 	await ctx.waitForIdle();
 
 	if (isClean(ctx)) {
-		if (ctx.hasUI && source === "manual") {
+		if (ctx.hasUI) {
 			notify(ctx, "Session is already clean (context window is 0)", "info");
 		}
 		moduleState.updateStatus(ctx);
@@ -851,6 +885,7 @@ const runClear = async (
 		enabled: moduleState.state.enabled,
 		lastClearAt: Date.now(),
 		idleTimeoutMs: moduleState.state.idleTimeoutMs,
+		contextCutoffAt: null,
 	};
 
 	const result = await ctx.newSession({
@@ -864,6 +899,7 @@ const runClear = async (
 				enabled: nextClearState.enabled,
 				lastClearAt: nextClearState.lastClearAt,
 				idleTimeoutMs: nextClearState.idleTimeoutMs,
+				contextCutoffAt: nextClearState.contextCutoffAt,
 				savedAt: Date.now(),
 			});
 
@@ -883,11 +919,10 @@ const runClear = async (
 			}
 		},
 		withSession: async (nextCtx) => {
+			rememberCommandContext(nextCtx);
 			if (nextCtx.hasUI) {
 				nextCtx.ui.notify(
-					source === "manual"
-						? "✨ 已清理上下文，迁移状态到新 session"
-						: "✨ Auto-clear 已清理上下文，迁移状态到新 session",
+					"✨ 已清理上下文，迁移状态到新 session",
 					"success",
 				);
 			}
@@ -895,11 +930,77 @@ const runClear = async (
 	});
 
 	if (result.cancelled && ctx.hasUI) {
-		notify(
-			ctx,
-			source === "manual" ? "Clear cancelled" : "Auto-clear cancelled",
-			"info",
-		);
+		notify(ctx, "Clear cancelled", "info");
+	}
+};
+
+const runAutoClear = async (
+	ctx: ExtensionCommandContext,
+	moduleState: ModuleState,
+): Promise<void> => {
+	rememberCommandContext(ctx);
+	moduleState.touch(ctx);
+	await ctx.waitForIdle();
+
+	if (isClean(ctx)) {
+		moduleState.updateStatus(ctx);
+		moduleState.scheduleAutoClear(ctx);
+		return;
+	}
+
+	const now = Date.now();
+	const migratedState = collectMigratedState(ctx);
+	const parentSession = ctx.sessionManager.getSessionFile();
+	const nextClearState: PersistedState = {
+		enabled: moduleState.state.enabled,
+		lastClearAt: now,
+		idleTimeoutMs: moduleState.state.idleTimeoutMs,
+		contextCutoffAt: null,
+	};
+
+	const result = await ctx.newSession({
+		parentSession,
+		setup: async (sm) => {
+			for (const entry of migratedState.customEntries) {
+				sm.appendCustomEntry(entry.customType, entry.data);
+			}
+
+			sm.appendCustomEntry(STATE_ENTRY_TYPE, {
+				enabled: nextClearState.enabled,
+				lastClearAt: nextClearState.lastClearAt,
+				idleTimeoutMs: nextClearState.idleTimeoutMs,
+				contextCutoffAt: nextClearState.contextCutoffAt,
+				savedAt: Date.now(),
+			});
+
+			if (migratedState.sessionName) {
+				sm.appendSessionInfo(migratedState.sessionName);
+			}
+
+			if (migratedState.model) {
+				sm.appendModelChange(
+					migratedState.model.provider,
+					migratedState.model.modelId,
+				);
+			}
+
+			if (migratedState.thinkingLevel) {
+				sm.appendThinkingLevelChange(migratedState.thinkingLevel);
+			}
+		},
+		withSession: async (nextCtx) => {
+			rememberCommandContext(nextCtx);
+			if (nextCtx.hasUI) {
+				nextCtx.ui.notify(
+					"✨ Auto-clear 已清理上下文，迁移到新 session",
+					"success",
+				);
+			}
+		},
+	});
+
+	if (result.cancelled && ctx.hasUI) {
+		notify(ctx, "Auto-clear cancelled", "info");
 	}
 };
 
@@ -914,7 +1015,6 @@ export default function (pi: ExtensionAPI) {
 		lastActivityAt: Date.now(),
 		currentCtx: null,
 		shuttingDown: false,
-		autoClearQueued: false,
 		timer: null,
 
 		persistOwnState() {
@@ -922,6 +1022,7 @@ export default function (pi: ExtensionAPI) {
 				enabled: ms.state.enabled,
 				lastClearAt: ms.state.lastClearAt,
 				idleTimeoutMs: ms.state.idleTimeoutMs,
+				contextCutoffAt: ms.state.contextCutoffAt,
 				savedAt: Date.now(),
 			});
 		},
@@ -948,6 +1049,7 @@ export default function (pi: ExtensionAPI) {
 					idleTimeoutMs:
 						asFiniteNumber(entry.data.idleTimeoutMs) ??
 						DEFAULT_IDLE_TIMEOUT_MS,
+					contextCutoffAt: asFiniteNumber(entry.data.contextCutoffAt),
 				};
 			}
 		},
@@ -975,9 +1077,10 @@ export default function (pi: ExtensionAPI) {
 			const autoText = ms.state.enabled
 				? theme.fg("success", "auto:on")
 				: theme.fg("dim", "auto:off");
-			const contextText = isClean(ctx)
+			const effectiveContextCount = getContextTokenCount(ctx);
+			const contextText = effectiveContextCount === 0
 				? theme.fg("success", "ctx:0")
-				: theme.fg("warning", `ctx:${getContextTokenCount(ctx)}`);
+				: theme.fg("warning", `ctx:${effectiveContextCount}`);
 			const idleText = ms.state.enabled
 				? theme.fg(
 						"dim",
@@ -1015,8 +1118,7 @@ export default function (pi: ExtensionAPI) {
 		if (
 			ms.shuttingDown ||
 			!ms.state.enabled ||
-			ms.currentCtx === null ||
-			ms.autoClearQueued
+			ms.currentCtx === null
 		)
 			return;
 
@@ -1041,15 +1143,44 @@ export default function (pi: ExtensionAPI) {
 			ms.scheduleAutoClear(ctx);
 			return;
 		}
-		ms.autoClearQueued = true;
-		await runClear(ctx, "auto", ms);
+
+		const commandCtx = getRememberedCommandContext();
+		if (commandCtx === null) {
+			const now = Date.now();
+			ms.lastActivityAt = now;
+			ms.updateStatus(ctx);
+			if (ctx.hasUI) {
+				notify(
+					ctx,
+					"Auto-clear 需要先通过 /clear-panel auto 或 /clear 获取 session 切换权限",
+					"warning",
+				);
+			}
+			ms.scheduleAutoClear(ctx);
+			return;
+		}
+
+		try {
+			await runAutoClear(commandCtx, ms);
+		} catch (err) {
+			clearRememberedCommandContext(commandCtx);
+			ms.lastActivityAt = Date.now();
+			ms.updateStatus(ctx);
+			if (ctx.hasUI) {
+				notify(
+					ctx,
+					`Auto-clear 无法切换 session: ${err instanceof Error ? err.message : String(err)}`,
+					"error",
+				);
+			}
+			ms.scheduleAutoClear(ctx);
+		}
 	};
 
 	// ─── 事件监听 ────────────────────────────────────────────────
 
 	pi.on("session_start", async (_event, ctx) => {
 		ms.shuttingDown = false;
-		ms.autoClearQueued = false;
 		ms.currentCtx = ctx;
 		ms.restoreStateFromSession(ctx);
 		ms.lastActivityAt = Date.now();
@@ -1059,12 +1190,27 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		ms.shuttingDown = true;
-		ms.autoClearQueued = false;
+		clearRememberedCommandContext();
 		if (ms.timer !== null) {
 			clearTimeout(ms.timer);
 			ms.timer = null;
 		}
 		if (ctx.hasUI) ctx.ui.setStatus(STATUS_ID, "");
+	});
+
+	pi.on("context", async (event) => {
+		const cutoffAt = ms.state.contextCutoffAt;
+		if (cutoffAt === null) return;
+
+		const filtered = event.messages.filter((message: any) => {
+			const timestamp = toTimestampMs(message.timestamp);
+			// Keep messages without timestamps to avoid dropping provider/system
+			// internals that are not part of the persisted conversation branch.
+			return timestamp === null || timestamp >= cutoffAt;
+		});
+
+		if (filtered.length === event.messages.length) return;
+		return { messages: filtered };
 	});
 
 	pi.on("input", async (_event, ctx) => {
@@ -1106,10 +1252,11 @@ export default function (pi: ExtensionAPI) {
 			return items.length > 0 ? items : null;
 		},
 		handler: async (args, ctx) => {
+			rememberCommandContext(ctx);
 			const sub = args.trim();
 
 			if (!sub) {
-				await showMainMenu(pi, ctx, ms);
+				await showMainMenu(ctx, ms);
 				return;
 			}
 
@@ -1163,12 +1310,12 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("clear", {
 		description: "立即清理上下文，迁移状态到新 session",
 		handler: async (args, ctx) => {
-			const trimmed = args.trim();
-			if (trimmed.length > 0 && trimmed !== "--auto") {
+			rememberCommandContext(ctx);
+			if (args.trim().length > 0) {
 				if (ctx.hasUI) notify(ctx, "Usage: /clear", "warning");
 				return;
 			}
-			await runClear(ctx, trimmed === "--auto" ? "auto" : "manual", ms);
+			await runClear(ctx, ms);
 		},
 	});
 }
