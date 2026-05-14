@@ -478,6 +478,32 @@ export default function githubPrCliExtension(pi: ExtensionAPI) {
     let pollInFlight = false;
     let snapshotLoaded = false;
     let snapshots = new Map<string, PullRequestSnapshot>();
+    let lifecycleGeneration = 0;
+    let shuttingDown = false;
+
+    const STALE_CONTEXT_MESSAGE_FRAGMENT = 'This extension ctx is stale';
+
+    function isStaleContextError(error: unknown): boolean {
+        return error instanceof Error && error.message.includes(STALE_CONTEXT_MESSAGE_FRAGMENT);
+    }
+
+    function retireStaleRuntime(): void {
+        active = false;
+        stopTimer();
+        pollInFlight = false;
+        ctxRef = undefined;
+        lifecycleGeneration++;
+    }
+
+    function handleMaybeStaleContext(error: unknown): boolean {
+        if (!isStaleContextError(error)) return false;
+        retireStaleRuntime();
+        return true;
+    }
+
+    function isGenerationCurrent(generation: number): boolean {
+        return active && !shuttingDown && generation === lifecycleGeneration;
+    }
 
     function persistState() {
         pi.appendEntry<PersistedState>(STATE_ENTRY, {
@@ -531,37 +557,56 @@ export default function githubPrCliExtension(pi: ExtensionAPI) {
     }
 
     function colorize(color: 'success' | 'warning' | 'error' | 'dim' | 'accent', text: string): string {
-        const theme = ctxRef?.ui?.theme;
-        if (!theme?.fg) return text;
-        return theme.fg(color, text);
+        try {
+            const ctx = ctxRef;
+            if (!ctx?.hasUI) return text;
+            const theme = ctx.ui.theme;
+            if (!theme?.fg) return text;
+            return theme.fg(color, text);
+        } catch (error) {
+            if (handleMaybeStaleContext(error)) return text;
+            throw error;
+        }
     }
 
     function notify(message: string, level: 'info' | 'warning' | 'error' = 'info'): void {
-        if (ctxRef?.hasUI) {
-            ctxRef.ui.notify(message, level);
-            return;
+        try {
+            const ctx = ctxRef;
+            if (ctx?.hasUI) {
+                ctx.ui.notify(message, level);
+                return;
+            }
+        } catch (error) {
+            if (handleMaybeStaleContext(error)) return;
+            throw error;
         }
         const prefix = level === 'error' ? '[github-pr:error]' : level === 'warning' ? '[github-pr:warn]' : '[github-pr]';
         console.log(`${prefix} ${message}`);
     }
 
     function updateStatus(): void {
-        if (!ctxRef?.hasUI) return;
+        try {
+            const ctx = ctxRef;
+            if (!ctx?.hasUI) return;
 
-        const headline = active
-            ? colorize('success', 'GH PR on')
-            : lastError
-                ? colorize('warning', 'GH PR off')
-                : colorize('dim', 'GH PR off');
+            const headline = active
+                ? colorize('success', 'GH PR on')
+                : lastError
+                    ? colorize('warning', 'GH PR off')
+                    : colorize('dim', 'GH PR off');
 
-        const details = ['source=gh-cli', repo || 'repo=unset', `mode=${mode}`, formatEventActionBadge(eventActions), formatMessageFieldBadge(messageFields)];
-        if (instruction) details.push('instruction=set');
-        if (trackedPullRequests > 0) details.push(`tracked=${trackedPullRequests}`);
-        if (lastPollAt) details.push(`polled=${lastPollAt}`);
-        if (lastEventSummary !== 'none') details.push(lastEventSummary);
-        if (lastError) details.push(`err=${lastError}`);
+            const details = ['source=gh-cli', repo || 'repo=unset', `mode=${mode}`, formatEventActionBadge(eventActions), formatMessageFieldBadge(messageFields)];
+            if (instruction) details.push('instruction=set');
+            if (trackedPullRequests > 0) details.push(`tracked=${trackedPullRequests}`);
+            if (lastPollAt) details.push(`polled=${lastPollAt}`);
+            if (lastEventSummary !== 'none') details.push(lastEventSummary);
+            if (lastError) details.push(`err=${lastError}`);
 
-        ctxRef.ui.setStatus(STATUS_KEY, `${headline} ${colorize('dim', formatStatusLine(details))}`);
+            ctx.ui.setStatus(STATUS_KEY, `${headline} ${colorize('dim', formatStatusLine(details))}`);
+        } catch (error) {
+            if (handleMaybeStaleContext(error)) return;
+            throw error;
+        }
     }
 
     function stopTimer(): void {
@@ -636,16 +681,22 @@ export default function githubPrCliExtension(pi: ExtensionAPI) {
     }
 
     function queueGitHubMessage(content: string, events: PullRequestEvent[]): void {
-        if (!ctxRef || mode !== 'auto-turn') return;
+        try {
+            const ctx = ctxRef;
+            if (!ctx || mode !== 'auto-turn') return;
 
-        const message = {
-            customType: 'github-pr',
-            content,
-            display: true,
-            details: events.length === 1 ? events[0] : events,
-        };
+            const message = {
+                customType: 'github-pr',
+                content,
+                display: true,
+                details: events.length === 1 ? events[0] : events,
+            };
 
-        pi.sendMessage(message, ctxRef.isIdle() ? { triggerTurn: true } : { deliverAs: 'followUp', triggerTurn: true });
+            pi.sendMessage(message, ctx.isIdle() ? { triggerTurn: true } : { deliverAs: 'followUp', triggerTurn: true });
+        } catch (error) {
+            if (handleMaybeStaleContext(error)) return;
+            throw error;
+        }
     }
 
     function shouldDisplayEvent(event: PullRequestEvent): boolean {
@@ -680,11 +731,14 @@ export default function githubPrCliExtension(pi: ExtensionAPI) {
     }
 
     async function pollOnce(options?: { initial?: boolean; silentErrors?: boolean }): Promise<void> {
-        if (!active || pollInFlight) return;
+        if (!active || pollInFlight || shuttingDown) return;
 
+        const pollGeneration = lifecycleGeneration;
         pollInFlight = true;
         try {
             const currentSnapshots = await loadCurrentSnapshots();
+            if (!isGenerationCurrent(pollGeneration)) return;
+
             trackedPullRequests = currentSnapshots.size;
             lastPollAt = new Date().toLocaleTimeString();
 
@@ -701,10 +755,12 @@ export default function githubPrCliExtension(pi: ExtensionAPI) {
             lastError = '';
             updateStatus();
 
+            if (!isGenerationCurrent(pollGeneration)) return;
             if (events.length > 0) {
                 handleBatchEvents(events);
             }
         } catch (error) {
+            if (handleMaybeStaleContext(error) || !isGenerationCurrent(pollGeneration)) return;
             lastError = summarizeError(error);
             updateStatus();
             if (!options?.silentErrors) {
@@ -730,10 +786,14 @@ export default function githubPrCliExtension(pi: ExtensionAPI) {
         }
 
         clearRuntimeState();
+        shuttingDown = false;
         active = true;
+        const startGeneration = lifecycleGeneration;
         updateStatus();
+        if (!isGenerationCurrent(startGeneration)) return;
 
         await pollOnce({ initial: true, silentErrors: options?.silent });
+        if (!isGenerationCurrent(startGeneration)) return;
         if (!snapshotLoaded) {
             active = false;
             updateStatus();
@@ -741,7 +801,10 @@ export default function githubPrCliExtension(pi: ExtensionAPI) {
         }
 
         pollingTimer = setInterval(() => {
-            void pollOnce();
+            void pollOnce().catch((error) => {
+                if (handleMaybeStaleContext(error)) return;
+                console.error('[github-pr] unhandled poll error:', error);
+            });
         }, pollIntervalMs);
 
         persistState();
@@ -1289,6 +1352,8 @@ export default function githubPrCliExtension(pi: ExtensionAPI) {
     }
 
     pi.on('session_start', async (_event, ctx) => {
+        lifecycleGeneration++;
+        shuttingDown = false;
         ctxRef = ctx;
         active = false;
         clearRuntimeState();
@@ -1320,7 +1385,10 @@ export default function githubPrCliExtension(pi: ExtensionAPI) {
     });
 
     pi.on('session_shutdown', async () => {
+        shuttingDown = true;
+        lifecycleGeneration++;
         await stopListening({ silent: true, persist: false });
+        ctxRef = undefined;
     });
 
     // When the user manually sends a message, bump the instruction generation
