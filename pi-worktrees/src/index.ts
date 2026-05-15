@@ -16,6 +16,7 @@ import { cmdRemove } from './cmds/cmdRemove.ts';
 import { cmdSettings } from './cmds/cmdSettings.ts';
 import { cmdStatus } from './cmds/cmdStatus.ts';
 import { cmdTemplates } from './cmds/cmdTemplates.ts';
+import { SessionSwitched } from './cmds/cmdSwitch.ts';
 import { createPiWorktreeConfigService } from './services/config/config.ts';
 import { createCompletionFactory } from './services/completions.ts';
 import { StatusIndicator } from './ui/status.ts';
@@ -146,6 +147,11 @@ const PiWorktreeExtension: ExtensionFactory = async function (pi) {
 
         await command(rest.join(' '), ctx, deps);
       } catch (error) {
+        // SessionSwitched is thrown after a successful session switch.
+        // The old ctx is stale — silently exit without touching it.
+        if (error instanceof SessionSwitched) {
+          return;
+        }
         const message = error instanceof Error ? error.message : String(error);
         ctx.ui.notify(`Worktree command failed: ${message}`, 'error');
       }

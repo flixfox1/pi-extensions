@@ -5,6 +5,7 @@ import type { CmdHandler, WorktreeCreatedContext } from '../types.ts';
 import { resolveLogfilePath, runHook, sanitizePathPart, type HookProgressEvent } from './shared.ts';
 import { expandTemplate } from '../services/templates.ts';
 import { withHookProgressPanel } from '../ui/hookProgressPanel.ts';
+import { switchToWorktree } from './cmdSwitch.ts';
 
 function formatWorktreeOption(worktree: WorktreeInfo): string {
   const markers = [worktree.isMain ? '[main]' : '', worktree.isCurrent ? '[current]' : '']
@@ -87,7 +88,7 @@ export const cmdList: CmdHandler = async (_args, ctx, deps) => {
   const current = deps.configService.current({ cwd: target.path });
 
   if (!current.onSwitch) {
-    ctx.ui.notify(`No onSwitch configured for: ${target.path}`, 'info');
+    await switchToWorktree(target.path, ctx, deps);
     return;
   }
 
@@ -136,15 +137,16 @@ export const cmdList: CmdHandler = async (_args, ctx, deps) => {
     if (!result.success) {
       stopBusy();
       deps.statusService.critical(ctx, `onSwitch failed`);
-      ctx.ui.notify(`onSwitch failed`, 'error');
+      ctx.ui.notify(`onSwitch failed. Start manually: cd ${target.path} && pi`, 'error');
       return;
     }
 
     stopBusy();
     deps.statusService.positive(ctx, `onSwitch complete: ${target.branch}`);
+    await switchToWorktree(target.path, ctx, deps);
   } catch (err) {
     stopBusy();
     deps.statusService.critical(ctx, `onSwitch failed`);
-    ctx.ui.notify(`onSwitch failed: ${(err as Error).message}`, 'error');
+    ctx.ui.notify(`onSwitch failed: ${(err as Error).message}. Start manually: cd ${target.path} && pi`, 'error');
   }
 };

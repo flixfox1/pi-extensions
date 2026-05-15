@@ -18,6 +18,7 @@ import { getConfiguredWorktreeRoot, type MatchingStrategy, type WorktreeSettings
 import { cmdRemove } from '../cmds/cmdRemove.ts';
 import { cmdPrune } from '../cmds/cmdPrune.ts';
 import { cmdTemplates } from '../cmds/cmdTemplates.ts';
+import { switchToWorktree, SessionSwitched } from '../cmds/cmdSwitch.ts';
 import { cmdInit } from '../cmds/cmdInit.ts';
 import { resolveLogfilePath, runHook, runOnCreateHook, sanitizePathPart, type HookProgressEvent } from '../cmds/shared.ts';
 import { DefaultLogfileTemplate } from '../services/config/config.ts';
@@ -291,7 +292,10 @@ async function showListPanel(ctx: ExtensionCommandContext, deps: CommandDeps): P
   if (action === 'remove') { await cmdRemove(basename(target.path), ctx, deps); return; }
   if (action === 'switch') {
     const current = snap.settings;
-    if (!current.onSwitch) { notify(ctx, `Worktree path: ${target.path}`, 'info'); return; }
+    if (!current.onSwitch) {
+      await switchToWorktree(target.path, ctx, deps);
+      return;
+    }
 
     const sessionId = sanitizePathPart(ctx.sessionManager?.getSessionId?.() || 'session');
     const safeName = sanitizePathPart(basename(target.path));
@@ -329,6 +333,7 @@ async function showListPanel(ctx: ExtensionCommandContext, deps: CommandDeps): P
       deps.statusService.critical(ctx, 'onSwitch failed');
       notify(ctx, `onSwitch failed: ${(error as Error).message}`, 'error');
     }
+    await switchToWorktree(target.path, ctx, deps);
   }
 }
 

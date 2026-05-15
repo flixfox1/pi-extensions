@@ -22,10 +22,23 @@ const EVENT_ACTIONS = [
     'merged',
     'discovered',
     'state_changed',
+    'ci-fail',
+    'ci-pass',
 ] as const;
 
 type EventAction = typeof EVENT_ACTIONS[number];
 type EventActionFilter = EventAction[] | null;
+
+type ChecksSummary = {
+    /** Overall rollup: 'pass' if all pass, 'fail' if any fail, 'pending' if any pending, 'unknown' if no checks */
+    rollup: 'pass' | 'fail' | 'pending' | 'unknown';
+    /** Individual check names that are failing */
+    failedChecks: string[];
+    /** Individual check names that are passing */
+    passedChecks: string[];
+    /** Individual check names that are pending */
+    pendingChecks: string[];
+};
 
 type PullRequestSnapshot = {
     number: number;
@@ -37,6 +50,7 @@ type PullRequestSnapshot = {
     draft: boolean;
     state: PrState;
     updatedAt?: string;
+    checks?: ChecksSummary;
 };
 
 type PullRequestEvent = PullRequestSnapshot & {
@@ -46,6 +60,7 @@ type PullRequestEvent = PullRequestSnapshot & {
     detectedAt: string;
     previousState?: PrState;
     previousUpdatedAt?: string;
+    previousChecks?: ChecksSummary;
 };
 
 type PersistedState = {
@@ -79,7 +94,7 @@ type RawGhPullRequest = {
 
 const DELIVERY_MODES: DeliveryMode[] = ['notify-only', 'auto-turn'];
 const COMMANDS = [
-    'start', 'stop', 'status', 'test',
+    'start', 'stop', 'status', 'test', 'refresh',
     'events', 'events all', 'events none',
     'fields', 'fields all', 'fields none',
     'instruction', 'instruction clear',
@@ -99,6 +114,7 @@ const MESSAGE_FIELDS = [
     'baseHead',
     'updated',
     'url',
+    'checks',
 ] as const;
 
 type MessageField = typeof MESSAGE_FIELDS[number];
@@ -115,6 +131,7 @@ const MESSAGE_FIELD_DESCRIPTIONS: Record<MessageField, string> = {
     baseHead: 'baseHead — Base ← Head branches',
     updated: 'updated — Last updated timestamp',
     url: 'url — GitHub PR URL',
+    checks: 'checks — CI check status summary',
 };
 
 const EVENT_ACTION_DESCRIPTIONS: Record<EventAction, string> = {
@@ -130,6 +147,8 @@ const EVENT_ACTION_DESCRIPTIONS: Record<EventAction, string> = {
     merged: 'merged — merged PRs',
     discovered: 'discovered — inferred non-open first sighting',
     state_changed: 'state_changed — fallback state transition',
+    'ci-fail': 'ci-fail — CI checks went from pass/pending to fail',
+    'ci-pass': 'ci-pass — CI checks went from fail to pass',
 };
 
 const ENV_FILE_SAVE_PATH = path.join(homedir(), '.pi', 'agent', 'extensions', 'github-pr', '.env');
@@ -215,6 +234,16 @@ function formatTimestamp(rawValue?: string): string {
     return Number.isNaN(date.getTime()) ? rawValue : date.toLocaleString();
 }
 
+function formatChecksSummary(checks?: ChecksSummary): string {
+    if (!checks) return 'unknown';
+    if (checks.rollup === 'unknown') return 'no checks';
+    const parts: string[] = [checks.rollup];
+    if (checks.failedChecks.length > 0) parts.push(`failed: ${checks.failedChecks.join(', ')}`);
+    if (checks.passedChecks.length > 0) parts.push(`passed: ${checks.passedChecks.length}`);
+    if (checks.pendingChecks.length > 0) parts.push(`pending: ${checks.pendingChecks.length}`);
+    return parts.join(' | ');
+}
+
 function formatPrEvent(event: PullRequestEvent, fieldFilter: MessageFieldFilter): string {
     const baseHead = event.baseRef && event.headRef ? `${event.baseRef} ← ${event.headRef}` : 'n/a';
 
@@ -229,6 +258,7 @@ function formatPrEvent(event: PullRequestEvent, fieldFilter: MessageFieldFilter)
         baseHead: `Base/Head: ${baseHead}`,
         updated: `Updated: ${formatTimestamp(event.updatedAt)}`,
         url: `URL: ${event.url}`,
+        checks: `Checks: ${formatChecksSummary(event.checks)}`,
     };
 
     const selectedFields: MessageField[] = fieldFilter === null
@@ -397,23 +427,53 @@ function detectAction(previous: PullRequestSnapshot | undefined, current: PullRe
     return null;
 }
 
+function detectChecksAction(previous: PullRequestSnapshot | undefined, current: PullRequestSnapshot): 'ci-fail' | 'ci-pass' | null {
+    if (!previous?.checks || !current.checks) return null;
+    // Only track check transitions for open PRs
+    if (current.state !== 'OPEN') return null;
+
+    const prevRollup = previous.checks.rollup;
+    const curRollup = current.checks.rollup;
+
+    if (curRollup === 'fail' && prevRollup !== 'fail') return 'ci-fail';
+    if (curRollup === 'pass' && prevRollup === 'fail') return 'ci-pass';
+
+    return null;
+}
+
 function diffSnapshots(repo: string, previous: Map<string, PullRequestSnapshot>, current: Map<string, PullRequestSnapshot>): PullRequestEvent[] {
     const events: PullRequestEvent[] = [];
 
     for (const [key, currentSnapshot] of current.entries()) {
         const previousSnapshot = previous.get(key);
         const action = detectAction(previousSnapshot, currentSnapshot);
-        if (!action) continue;
+        if (action) {
+            events.push({
+                ...currentSnapshot,
+                id: `gh-cli:${repo}:${currentSnapshot.number}:${action}:${currentSnapshot.updatedAt ?? Date.now()}`,
+                repo,
+                action,
+                detectedAt: new Date().toISOString(),
+                previousState: previousSnapshot?.state,
+                previousUpdatedAt: previousSnapshot?.updatedAt,
+                previousChecks: previousSnapshot?.checks,
+            });
+        }
 
-        events.push({
-            ...currentSnapshot,
-            id: `gh-cli:${repo}:${currentSnapshot.number}:${action}:${currentSnapshot.updatedAt ?? Date.now()}`,
-            repo,
-            action,
-            detectedAt: new Date().toISOString(),
-            previousState: previousSnapshot?.state,
-            previousUpdatedAt: previousSnapshot?.updatedAt,
-        });
+        // Check transitions are emitted as separate events
+        const checksAction = detectChecksAction(previousSnapshot, currentSnapshot);
+        if (checksAction) {
+            events.push({
+                ...currentSnapshot,
+                id: `gh-cli:${repo}:${currentSnapshot.number}:${checksAction}:${currentSnapshot.updatedAt ?? Date.now()}`,
+                repo,
+                action: checksAction,
+                detectedAt: new Date().toISOString(),
+                previousState: previousSnapshot?.state,
+                previousUpdatedAt: previousSnapshot?.updatedAt,
+                previousChecks: previousSnapshot?.checks,
+            });
+        }
     }
 
     return events.sort((a, b) => a.number - b.number);
@@ -645,6 +705,138 @@ export default function githubPrCliExtension(pi: ExtensionAPI) {
         return toSnapshotMap(parseGhPullRequests(String(result.stdout ?? '[]')));
     }
 
+    /**
+     * Fetch CI check status for a batch of PR numbers using gh api.
+     * Returns a map from PR number to ChecksSummary.
+     */
+    async function fetchChecksForPrs(prNumbers: number[]): Promise<Map<number, ChecksSummary>> {
+        const result = new Map<number, ChecksSummary>();
+        if (prNumbers.length === 0) return result;
+
+        // Use a GraphQL batch query to avoid N separate gh invocations
+        const query = `
+            query($owner: String!, $repo: String!, $numbers: [Int!]!) {
+                repository(owner: $owner, name: $repo) {
+                    pullRequests(first: 100, orderBy: {field: CREATED_AT, direction: DESC}) {
+                        nodes {
+                            number
+                            commits(last: 1) {
+                                nodes {
+                                    commit {
+                                        statusCheckRollup {
+                                            state
+                                            contexts(last: 50) {
+                                                nodes {
+                                                    ... on CheckRun {
+                                                        name
+                                                        conclusion
+                                                        status
+                                                    }
+                                                    ... on StatusContext {
+                                                        context
+                                                        state
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }`;
+
+        const [owner, repoName] = repo.split('/');
+        if (!owner || !repoName) return result;
+
+        const prNumbersSet = new Set(prNumbers);
+
+        try {
+            const gqlResult = await pi.exec(
+                ghBin,
+                ['api', 'graphql', '-f', `query=${query}`, '-f', `owner=${owner}`, '-f', `repo=${repoName}`],
+                { timeout: commandTimeoutMs },
+            );
+
+            if (gqlResult.code !== 0) return result;
+
+            const response = JSON.parse(String(gqlResult.stdout ?? '{}'));
+            const nodes = response?.data?.repository?.pullRequests?.nodes;
+            if (!Array.isArray(nodes)) return result;
+
+            for (const pr of nodes) {
+                if (!prNumbersSet.has(pr.number)) continue;
+
+                const rollup = pr?.commits?.nodes?.[0]?.commit?.statusCheckRollup;
+                if (!rollup) {
+                    result.set(pr.number, { rollup: 'unknown', failedChecks: [], passedChecks: [], pendingChecks: [] });
+                    continue;
+                }
+
+                const failedChecks: string[] = [];
+                const passedChecks: string[] = [];
+                const pendingChecks: string[] = [];
+
+                const contexts = rollup.contexts?.nodes ?? [];
+                for (const ctx of contexts) {
+                    // CheckRun style
+                    if (ctx.name !== undefined) {
+                        if (ctx.conclusion === 'FAILURE' || ctx.conclusion === 'TIMED_OUT' || ctx.conclusion === 'CANCELLED') {
+                            failedChecks.push(ctx.name);
+                        } else if (ctx.conclusion === 'SUCCESS') {
+                            passedChecks.push(ctx.name);
+                        } else if (ctx.status === 'IN_PROGRESS' || ctx.status === 'QUEUED') {
+                            pendingChecks.push(ctx.name);
+                        } else if (ctx.conclusion === 'NEUTRAL' || ctx.conclusion === 'SKIPPED') {
+                            // skip neutral/skipped
+                        } else {
+                            pendingChecks.push(ctx.name);
+                        }
+                    }
+                    // StatusContext style (legacy)
+                    else if (ctx.context !== undefined) {
+                        if (ctx.state === 'FAILURE' || ctx.state === 'ERROR') {
+                            failedChecks.push(ctx.context);
+                        } else if (ctx.state === 'SUCCESS') {
+                            passedChecks.push(ctx.context);
+                        } else if (ctx.state === 'PENDING') {
+                            pendingChecks.push(ctx.context);
+                        }
+                    }
+                }
+
+                let overall: ChecksSummary['rollup'] = 'unknown';
+                if (failedChecks.length > 0) overall = 'fail';
+                else if (pendingChecks.length > 0) overall = 'pending';
+                else if (passedChecks.length > 0) overall = 'pass';
+
+                result.set(pr.number, { rollup: overall, failedChecks, passedChecks, pendingChecks });
+            }
+        } catch {
+            // Non-fatal: checks enrichment is best-effort
+        }
+
+        return result;
+    }
+
+    /** Enrich snapshot map with CI check data for open PRs */
+    async function enrichWithChecks(snapshots: Map<string, PullRequestSnapshot>): Promise<void> {
+        const openPrNumbers: number[] = [];
+        for (const snap of snapshots.values()) {
+            if (snap.state === 'OPEN') openPrNumbers.push(snap.number);
+        }
+        if (openPrNumbers.length === 0) return;
+
+        const checksMap = await fetchChecksForPrs(openPrNumbers);
+        for (const [key, snap] of snapshots.entries()) {
+            const checks = checksMap.get(snap.number);
+            if (checks) {
+                snapshots.set(key, { ...snap, checks });
+            }
+        }
+    }
+
     function buildBatchMessageContent(events: PullRequestEvent[]): string {
         const parts: string[] = [];
 
@@ -737,6 +929,10 @@ export default function githubPrCliExtension(pi: ExtensionAPI) {
         pollInFlight = true;
         try {
             const currentSnapshots = await loadCurrentSnapshots();
+            if (!isGenerationCurrent(pollGeneration)) return;
+
+            // Enrich open PRs with CI check status (best-effort)
+            await enrichWithChecks(currentSnapshots);
             if (!isGenerationCurrent(pollGeneration)) return;
 
             trackedPullRequests = currentSnapshots.size;
@@ -1295,6 +1491,12 @@ export default function githubPrCliExtension(pi: ExtensionAPI) {
             }
             const testAction = enabledActions[0] ?? 'opened';
             const demoRepo = repo || 'owner/repo';
+            const testChecks: ChecksSummary = {
+                rollup: testAction === 'ci-fail' ? 'fail' : testAction === 'ci-pass' ? 'pass' : 'pass',
+                failedChecks: testAction === 'ci-fail' ? ['Lint → Test → Build'] : [],
+                passedChecks: testAction === 'ci-pass' || testAction !== 'ci-fail' ? ['Lint → Test → Build'] : [],
+                pendingChecks: [],
+            };
             const testEvent: PullRequestEvent = {
                 id: `local-test-${Date.now()}`,
                 repo: demoRepo,
@@ -1308,6 +1510,7 @@ export default function githubPrCliExtension(pi: ExtensionAPI) {
                 draft: false,
                 state: 'OPEN',
                 updatedAt: new Date().toISOString(),
+                checks: testChecks,
                 detectedAt: new Date().toISOString(),
             };
 
@@ -1325,6 +1528,90 @@ export default function githubPrCliExtension(pi: ExtensionAPI) {
                 const content = buildBatchMessageContent([testEvent]);
                 notify(`[test preview] PR #${testEvent.number} ${testEvent.action}: ${testEvent.title}`);
                 notify(`notify-only mode — message not delivered to agent. Content preview:\n${content}`);
+            }
+            return;
+        }
+
+        if (action === 'refresh') {
+            if (pollInFlight) {
+                notify('A poll is already in progress. Wait for it to complete.', 'warning');
+                return;
+            }
+            if (!repo) {
+                notify('No repo configured. Set PI_GH_PR_REPO in env.', 'warning');
+                return;
+            }
+
+            notify('Fetching GitHub PR state...', 'info');
+            try {
+                const currentSnapshots = await loadCurrentSnapshots();
+                await enrichWithChecks(currentSnapshots);
+
+                trackedPullRequests = currentSnapshots.size;
+                lastPollAt = new Date().toLocaleTimeString();
+                lastError = '';
+
+                const prevSnapshots = snapshots;
+                const hasPrevSnapshot = snapshotLoaded && prevSnapshots.size > 0;
+
+                // Collect events: diff against previous snapshot (or synthesize for first run)
+                let events: PullRequestEvent[] = [];
+
+                if (hasPrevSnapshot) {
+                    events = diffSnapshots(repo, prevSnapshots, currentSnapshots);
+                    // Any open PR without a diff event gets state_changed so the agent still sees it
+                    const coveredNumbers = new Set(events.map((e) => e.number));
+                    for (const snap of currentSnapshots.values()) {
+                        if (snap.state === 'OPEN' && !coveredNumbers.has(snap.number)) {
+                            events.push({
+                                ...snap,
+                                id: `gh-cli:${repo}:${snap.number}:state_changed:${snap.updatedAt ?? Date.now()}`,
+                                repo,
+                                action: 'state_changed',
+                                detectedAt: new Date().toISOString(),
+                            });
+                        }
+                    }
+                } else {
+                    // First time — synthesize opened events for open PRs
+                    for (const snap of currentSnapshots.values()) {
+                        if (snap.state === 'OPEN') {
+                            events.push({
+                                ...snap,
+                                id: `gh-cli:${repo}:${snap.number}:opened:${snap.updatedAt ?? Date.now()}`,
+                                repo,
+                                action: 'opened',
+                                detectedAt: new Date().toISOString(),
+                            });
+                        }
+                    }
+                }
+
+                // Update stored snapshot so next refresh can diff
+                snapshots = currentSnapshots;
+                snapshotLoaded = true;
+
+                if (events.length > 0) {
+                    // Always force-inject into session for refresh, regardless of mode or event-action filter
+                    lastEventSummary = events.length === 1
+                        ? `#${events[0].number} ${events[0].action}`
+                        : `${events.length} events: ${events.map((e) => `#${e.number}`).join(', ')}`;
+                    updateStatus();
+
+                    const content = buildBatchMessageContent(events);
+                    pi.sendMessage(
+                        { customType: 'github-pr', content, display: true, details: events.length === 1 ? events[0] : events },
+                        ctx.isIdle() ? { triggerTurn: true } : { deliverAs: 'followUp', triggerTurn: true },
+                    );
+                    notify(`Injected ${events.length} PR event(s) into session.`, 'info');
+                } else {
+                    updateStatus();
+                    notify('Refresh complete — no open PRs found.', 'info');
+                }
+            } catch (error) {
+                lastError = summarizeError(error);
+                updateStatus();
+                notify(`GitHub PR refresh failed: ${lastError}`, 'warning');
             }
             return;
         }
@@ -1412,7 +1699,7 @@ export default function githubPrCliExtension(pi: ExtensionAPI) {
 
             if (!trimmedArgs) {
                 if (!ctx.hasUI) {
-                    notify('Usage: /gh-pr <start|stop|status|test|events|fields|instruction|mode notify-only|mode auto-turn>', 'warning');
+                    notify('Usage: /gh-pr <start|stop|status|test|refresh|events|fields|instruction|mode notify-only|mode auto-turn>', 'warning');
                     return;
                 }
 
@@ -1421,6 +1708,7 @@ export default function githubPrCliExtension(pi: ExtensionAPI) {
                     const items = [
                         active ? 'stop' : 'start',
                         'status',
+                        'refresh',
                         'test',
                         'events',
                         'fields',

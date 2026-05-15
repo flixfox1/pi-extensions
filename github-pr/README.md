@@ -113,13 +113,13 @@ PI_GH_PR_GH_BIN=gh
 
 ## Keyboard shortcut
 
-### `Ctrl+S` — Save to defaults
+### `Ctrl+S` - Save to defaults
 
 Available inside all `/gh-pr` interactive screens (status, events, fields, instruction).
 
 Pressing `Ctrl+S` writes the **current runtime configuration** (mode, event actions, message fields, instruction) to `~/.pi/agent/extensions/github-pr/.env` so that new Pi sessions inherit these values as defaults.
 
-The file is updated in-place — existing env keys not managed by the extension are left untouched.
+The file is updated in-place - existing env keys not managed by the extension are left untouched.
 
 ---
 
@@ -156,6 +156,25 @@ Shows current runtime state:
 - last event
 - last error
 
+### `/gh-pr refresh`
+Manually fetches the latest PR state from GitHub and injects new events directly into the session.
+
+Behavior:
+
+- **No watcher dependency** — works even if `/gh-pr start` was never called
+- fetches latest PR list via `gh pr list`
+- enriches open PRs with CI check status
+- diffs against the previous snapshot (from watcher or a previous `/gh-pr refresh`)
+- on first run with no prior snapshot, all open PRs appear as `discovered` events
+- **always injects into the session** as an agent message (auto-turn), regardless of the current delivery mode
+- respects the event-action filter — only enabled event types are injected
+
+Typical uses:
+
+- push a fix and want the agent to see CI turn green → `/gh-pr refresh` emits `ci-pass`
+- want the agent to react to a new PR immediately without waiting for poll → `/gh-pr refresh`
+- first-time use without running the watcher → `/gh-pr refresh` discovers all open PRs
+
 ### `/gh-pr test`
 Injects a local fake PR event directly into the extension.
 
@@ -191,6 +210,7 @@ Available fields:
 
 | Field | Description |
 |-------|-------------|
+| `checks` | CI check status summary |
 | `repo` | Repository name |
 | `event` | Detected action type |
 | `pr` | Pull request number |
@@ -310,7 +330,7 @@ Optional comma-separated allowlist of PR event types shown in this session befor
 Examples:
 
 ```bash
-PI_GH_PR_EVENT_ACTIONS=merged,closed,ready_for_review
+PI_GH_PR_EVENT_ACTIONS=merged,closed,ready_for_review,ci-fail
 PI_GH_PR_EVENT_ACTIONS=all
 PI_GH_PR_EVENT_ACTIONS=none
 ```
@@ -396,6 +416,8 @@ Common emitted actions include:
 - `merged`
 - `discovered`
 - `state_changed`
+- `ci-fail` — CI checks transitioned from pass/pending to fail
+- `ci-pass` — CI checks transitioned from fail to pass
 
 The exact action depends on what changed between two consecutive `gh` snapshots.
 
@@ -424,10 +446,24 @@ Only later changes are delivered.
 
 ### Snapshot-based, not event-perfect
 
-This extension sees **current PR state**, not GitHub’s native webhook event stream.
+This extension sees **current PR state**, not GitHub's native webhook event stream.
 So it may infer `updated` or `state_changed` where a webhook system would have emitted a more specific event.
 
 For local personal usage, this is usually the right trade-off.
+
+### CI check detection
+
+The watcher enriches open PRs with CI check status on every poll cycle using the GitHub GraphQL API.
+Check transitions are detected independently from PR state changes:
+
+- **`ci-fail`** — emitted when any CI check transitions from pass or pending to failure
+- **`ci-pass`** — emitted when all previously-failing checks transition to pass
+
+Only open PRs are checked. Closed/merged PRs are skipped.
+
+The check data uses `statusCheckRollup` from the latest commit, which covers both GitHub Actions check runs and legacy commit status contexts.
+
+A new message field `checks` is available (enabled by default) that shows the check summary in event messages.
 
 ### No webhook/tunnel setup
 
